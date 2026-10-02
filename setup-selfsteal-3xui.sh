@@ -2,7 +2,7 @@
 # Interactive, fail-closed self-steal Reality setup; official 3x-ui v3.8.5.
 set -Eeuo pipefail
 umask 077
-VERSION=3.8.5
+XUI_VERSION=3.8.5
 # Network checks must observe this machine, not an inherited proxy.
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY
 CHECK=0
@@ -868,9 +868,9 @@ if (( STOCK_DEFAULT || ! NGINX_WAS_INSTALLED )) && [[ -L /etc/nginx/sites-enable
 fi
 if [[ $(state_get is_existing) != true ]]; then
   case $(uname -m) in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) fail 'Fresh install supports amd64/arm64 only.';; esac
-  echo "Fetching pinned 3x-ui $VERSION release metadata from GitHub..."
+  echo "Fetching pinned 3x-ui $XUI_VERSION release metadata from GitHub..."
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-    "https://api.github.com/repos/MHSanaei/3x-ui/releases/tags/v$VERSION" -o "$WORK/release.json"
+    "https://api.github.com/repos/MHSanaei/3x-ui/releases/tags/v$XUI_VERSION" -o "$WORK/release.json"
   python3 - "$WORK/release.json" "$ARCH" "$WORK/release-meta" <<'PY'
 import json,re,sys
 r=json.load(open(sys.argv[1])); name=f'x-ui-linux-{sys.argv[2]}.tar.gz'
