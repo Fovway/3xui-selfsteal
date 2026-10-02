@@ -179,6 +179,10 @@ def inspect(state):
         state['inbound_id'] = matches[0]['id'] if matches else None
     else:
         state['inbound_id'] = None
+        # Plan the fresh route before nginx preflight; bootstrap must reuse it.
+        state['panel_port'] = int(state.get('panel_port', 2053))
+        state['panel_url'] = 'http://127.0.0.1:%d/%s/' % (
+            state['panel_port'], secrets.token_urlsafe(24))
     ss = subprocess.run(['ss', '-H', '-ltnp', 'sport = :443'], capture_output=True, text=True, check=True).stdout
     if ss.strip() and not matches:
         raise RuntimeError('TCP443 is occupied outside a compatible local3x-ui Reality inbound; no service will be killed')
@@ -212,7 +216,7 @@ def bootstrap(state):
     username = 'admin_' + secrets.token_hex(10)
     password = secrets.token_urlsafe(36)
     hashed = bcrypt_password(password)
-    path = '/' + secrets.token_urlsafe(24) + '/'
+    path, _ = panel_route(state)
     Path(state['panel_db']).parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     run([state['panel_binary'], 'setting', '-listenIP', '127.0.0.1', '-port', str(port), '-webBasePath', path], state)
     # Only this newly initialized, never-started DB is written directly. The CLI
