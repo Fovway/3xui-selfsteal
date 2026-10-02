@@ -868,6 +868,7 @@ if (( STOCK_DEFAULT || ! NGINX_WAS_INSTALLED )) && [[ -L /etc/nginx/sites-enable
 fi
 if [[ $(state_get is_existing) != true ]]; then
   case $(uname -m) in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) fail 'Fresh install supports amd64/arm64 only.';; esac
+  echo "Fetching pinned 3x-ui $VERSION release metadata from GitHub..."
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
     "https://api.github.com/repos/MHSanaei/3x-ui/releases/tags/v$VERSION" -o "$WORK/release.json"
   python3 - "$WORK/release.json" "$ARCH" "$WORK/release-meta" <<'PY'
@@ -881,6 +882,7 @@ if url!=f'https://github.com/MHSanaei/3x-ui/releases/download/v3.8.5/{name}': sy
 open(sys.argv[3],'w').write(url+'\n'+a['digest'][7:]+'\n')
 PY
   mapfile -t META < "$WORK/release-meta"
+  printf 'Downloading verified 3x-ui archive from: <%s>\n' "${META[0]}"
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "${META[0]}" -o "$WORK/release.tar.gz"
   printf '%s  %s\n' "${META[1]}" "$WORK/release.tar.gz" | sha256sum --check --status || fail 'Release SHA256 mismatch.'
   # Validate all paths before extraction, including symlinks/hardlinks.
