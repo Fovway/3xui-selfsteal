@@ -966,6 +966,7 @@ PY
   ufw allow 80/tcp; ufw allow 443/tcp
   ufw --force enable
 fi
+echo "Requesting Let's Encrypt certificate with HTTP-01 for $DOMAIN..."
 CERT_ARGS=(certonly --non-interactive --agree-tos --webroot -w "$ROOT" -d "$DOMAIN" --keep-until-expiring)
 if [[ -n $EMAIL ]]; then CERT_ARGS+=(--email "$EMAIL"); else CERT_ARGS+=(--register-unsafely-without-email); fi
 certbot "${CERT_ARGS[@]}"
@@ -1007,6 +1008,7 @@ JAIL
   systemctl enable --now fail2ban
   systemctl restart fail2ban
 fi
+echo 'Configuring and verifying the 3x-ui Reality inbound...'
 helper configure
 helper verify
 helper export
@@ -1027,14 +1029,18 @@ PY
 SMOKE_PORT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["inbounds"][0]["port"])' "$WORK/smoke.json")
 "$XRAY" run -c "$WORK/smoke.json" > "$WORK/smoke.log" 2>&1 &
 SMOKE_PID=$!
+echo 'Testing the exported VLESS client through the Reality proxy...'
 for attempt in {1..30}; do
-  if curl --fail --silent --show-error --max-time 10 --socks5-hostname "127.0.0.1:$SMOKE_PORT" https://api.ipify.org > "$RESULT/proxy-exit-ip.txt" 2>/dev/null; then break; fi
+  if curl --fail --silent --show-error --max-time 10 --socks5-hostname "127.0.0.1:$SMOKE_PORT" https://api.ipify.org > "$RESULT/proxy-exit-ip.txt" 2>"$WORK/proxy-curl.err"; then break; fi
+  if (( attempt == 30 )); then echo 'Last curl diagnostic:' >&2; cat "$WORK/proxy-curl.err" >&2; fi
   kill -0 "$SMOKE_PID" 2>/dev/null || fail 'Real client Xray stopped; inspect private smoke log.'
   sleep 1
 done
-[[ -s $RESULT/proxy-exit-ip.txt ]] || fail 'Real client cannot reach HTTPS through Reality.'
+[[ -s $RESULT/proxy-exit-ip.txt ]] || fail 'Reality client HTTPS smoke failed; inspect the curl diagnostic above and the private Xray log.'
+echo 'Checking HTTPS through the Reality proxy...'
 curl --fail --silent --show-error --max-time 30 --socks5-hostname "127.0.0.1:$SMOKE_PORT" https://example.com/ -o "$WORK/proxy-https.html"
 kill "$SMOKE_PID"; wait "$SMOKE_PID" || true; SMOKE_PID=''
+echo "Checking the public HTTPS fallback for $DOMAIN..."
 curl --fail --silent --show-error --max-time 30 "https://$DOMAIN/" -o "$WORK/ordinary-https.html"
 # Independent trusted TLS and strict wrong/no-SNI proof through the public endpoint.
 python3 - "$DOMAIN" <<'PY'
@@ -1056,6 +1062,7 @@ for name in ('invalid.example',None):
 print('Wrong/no-SNI: rejected')
 PY
 helper verify
+echo 'Testing certificate renewal in dry-run mode...'
 certbot renew --dry-run --run-deploy-hooks --cert-name "$DOMAIN"
 qrencode -t UTF8 -o "$RESULT/client-qr.txt" < "$RESULT/client.txt"
 cp "$STATE" "$BACKUP/final-state.json"; chmod 600 "$BACKUP/final-state.json"
