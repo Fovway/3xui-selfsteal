@@ -15,7 +15,8 @@ Interactive Ubuntu/Debian systemd setup; no environment variables required.
 --check performs read-only inspection and DNS/conflict checks without credentials.
 Missing preflight utilities can be installed with separate explicit consent.
 These packages are retained if later validation fails; --check never installs.
-Existing3x-ui administrators/clients are preserved. Fresh panels are loopback-only.
+Existing3x-ui administrators/clients are preserved. Panels stay loopback-only;
+HTTPS panel access on the entered domain is offered by default at a secret path.
 Private results/backups are saved under /root/selfsteal-3xui/.
 HELP
       exit 0 ;;
@@ -74,6 +75,7 @@ import base64
 import copy
 import ctypes
 import ctypes.util
+import hashlib
 import http.cookiejar
 import ipaddress
 import json
@@ -162,14 +164,18 @@ def inspect(state):
             raise RuntimeError('Existing panel is not loopback-only. Restrict its listener explicitly before setup; admin settings will not be changed')
         if any(settings.get(k, 'false') == 'true' for k in ('subEnable', 'subJsonEnable', 'subClashEnable')) and settings.get('subListen', '') not in ('127.0.0.1', '::1'):
             raise RuntimeError('Existing subscription listener is public; restrict explicitly before setup')
-        if not state.get('panel_url'):
-            host = settings.get('webListen', '127.0.0.1')
-            host = '[' + host + ']' if ':' in host else host
-            scheme = 'https' if settings.get('webCertFile') and settings.get('webKeyFile') else 'http'
-            base_path = '/' + settings.get('webBasePath', '/').strip('/')
-            if base_path != '/':
-                base_path += '/'
-            state['panel_url'] = '%s://%s:%s%s' % (scheme, host, settings.get('webPort', '2053'), base_path)
+        host = settings['webListen']
+        host = '[' + host + ']' if ':' in host else host
+        scheme = 'https' if settings.get('webCertFile') and settings.get('webKeyFile') else 'http'
+        base_path = '/' + settings.get('webBasePath', '/').strip('/')
+        if base_path != '/':
+            base_path += '/'
+        detected_url = '%s://%s:%s%s' % (scheme, host, settings.get('webPort', '2053'), base_path)
+        if state.get('panel_url') and state['panel_url'].rstrip('/') != detected_url.rstrip('/'):
+            raise RuntimeError('Entered panel URL does not match the installed loopback listener/basePath')
+        state['panel_url'] = detected_url
+        if state.get('publish_panel'):
+            panel_route(state)
         state['inbound_id'] = matches[0]['id'] if matches else None
     else:
         state['inbound_id'] = None
@@ -228,6 +234,206 @@ def bootstrap(state):
             raise RuntimeError('Fresh bootstrap safety verification failed')
     state.update(panel_username=username, panel_password=password, panel_port=port,
                  panel_url='http://127.0.0.1:%d%s' % (port, path), bootstrap_complete=True)
+
+
+def panel_route(state):
+    panel = urllib.parse.urlsplit(state['panel_url'])
+    if (panel.scheme not in ('http', 'https') or not panel.hostname
+            or not ipaddress.ip_address(panel.hostname).is_loopback
+            or panel.username or panel.password or panel.query or panel.fragment):
+        raise RuntimeError('Public panel upstream must be a literal loopback URL')
+    if not re.fullmatch(r'/[A-Za-z0-9_-]{20,128}/', panel.path):
+        raise RuntimeError('Public panel requires a unique random basePath (20+ URL-safe characters). Set it manually in 3x-ui over the SSH tunnel, then rerun; no panel settings were changed')
+    origin = urllib.parse.urlunsplit((panel.scheme, panel.netloc, '', '', ''))
+    return panel.path, origin
+
+
+def nginx_nodes(text):
+    # Preserve source offsets; braces inside comments/quoted values are not syntax.
+    tokens = []
+    pattern = re.compile(r'\s+|#[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[{};]|[^\s{};#"\']+')
+    end = 0
+    for m in pattern.finditer(text):
+        if m.start() != end:
+            raise RuntimeError('Cannot safely parse custom nginx syntax')
+        end = m.end()
+        raw = m.group()
+        if raw.isspace() or raw.startswith('#'):
+            continue
+        if '\\' in raw:
+            raise RuntimeError('Escaped nginx syntax requires manual route configuration')
+        tokens.append((raw.strip('"\''), m.start(), m.end()))
+    if end != len(text):
+        raise RuntimeError('Cannot safely parse custom nginx syntax')
+    pos = 0
+    def block(nested=False):
+        nonlocal pos
+        nodes = []
+        while pos < len(tokens):
+            if tokens[pos][0] == '}':
+                if not nested:
+                    raise RuntimeError('Unexpected nginx closing brace')
+                close = tokens[pos][1]
+                pos += 1
+                return nodes, close
+            start = tokens[pos][1]
+            words = []
+            while pos < len(tokens) and tokens[pos][0] not in ('{', '}', ';'):
+                words.append(tokens[pos][0])
+                pos += 1
+            if not words or pos == len(tokens) or tokens[pos][0] == '}':
+                raise RuntimeError('Incomplete nginx directive')
+            delimiter = tokens[pos]
+            pos += 1
+            children, close = block(True) if delimiter[0] == '{' else (None, delimiter[1])
+            finish = tokens[pos - 1][2]
+            nodes.append(dict(words=words, children=children, start=start, end=finish, close=close))
+        if nested:
+            raise RuntimeError('Unclosed nginx block')
+        return nodes, len(text)
+    return block()[0]
+
+def connection_map(state):
+    name = '$selfsteal_connection_' + hashlib.sha256(state['domain'].encode()).hexdigest()[:16]
+    return name, f"# Managed by selfsteal-3xui: {state['domain']}\nmap $http_upgrade {name} {{ default upgrade; '' close; }}\n"
+
+
+
+def route_snippet(state):
+    path, origin = panel_route(state)
+    connection, _ = connection_map(state)
+    return f'''# Managed by selfsteal-3xui: {state['domain']}
+location = {path[:-1]} {{ return 308 {path}; }}
+location ^~ {path} {{
+    proxy_pass {origin};
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $proxy_protocol_addr;
+    proxy_set_header X-Forwarded-For $proxy_protocol_addr;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection {connection};
+    proxy_read_timeout 3600s;
+    proxy_buffering off;
+}}
+'''
+
+
+def plan_route(state):
+    site = state.get('nginx_site')
+    map_path = Path(state['panel_map'])
+    _, map_contents = connection_map(state)
+    state['panel_route_status'] = 'disabled'
+    state['public_url'] = None
+    state['script_exposed_public_admin'] = False
+    if not site:
+        if any(Path(state[k]).exists() or Path(state[k]).is_symlink() for k in ('panel_snippet', 'panel_map')):
+            raise RuntimeError('Managed panel file exists without a domain TLS site; inspect manually')
+        return None
+    target = Path(site).resolve(strict=True)
+    text = target.read_text()
+    nodes = nginx_nodes(text)
+    servers = [n for n in nodes if n['words'] == ['server'] and n['children'] is not None
+               and any(c['words'][0] == 'server_name' and state['domain'] in c['words'][1:] for c in n['children'])
+               and any(c['words'][0] == 'listen' and '127.0.0.1:9443' in c['words'] and 'ssl' in c['words'] and 'proxy_protocol' in c['words'] for c in n['children'])]
+    if len(servers) != 1:
+        raise RuntimeError('Cannot select exactly one domain TLS server for panel routing')
+    server = servers[0]
+    snippet = Path(state['panel_snippet'])
+    marker = re.compile(r'(?m)^    # selfsteal-3xui-panel ([0-9a-f]{64})\n    include ' + re.escape(str(snippet)) + r';\n')
+    owned = list(marker.finditer(text))
+    if len(owned) > 1:
+        raise RuntimeError('Duplicate managed panel includes')
+    if owned:
+        m = owned[0]
+        if not (server['start'] < m.start() < m.end() < server['end']) or not snippet.is_file() or snippet.is_symlink():
+            raise RuntimeError('Managed panel include/snippet ownership is inconsistent')
+        contents = snippet.read_bytes()
+        if hashlib.sha256(contents).hexdigest() != m[1] or not contents.startswith(('# Managed by selfsteal-3xui: ' + state['domain'] + '\n').encode()):
+            raise RuntimeError('Managed panel snippet was customized; refusing to replace/remove it')
+        if map_path.is_symlink() or not map_path.is_file() or map_path.read_text() != map_contents:
+            raise RuntimeError('Managed WebSocket map was customized or removed; refusing mutation')
+        clean = text[:m.start()] + text[m.end():]
+    else:
+        if snippet.exists() or snippet.is_symlink():
+            raise RuntimeError('Panel snippet exists without its owned include; inspect manually')
+        if map_path.exists() or map_path.is_symlink():
+            raise RuntimeError('WebSocket map exists without its owned panel include; inspect manually')
+        clean = text
+    if not state.get('publish_panel'):
+        # Custom public routes are deliberately outside our ownership.
+        state['panel_route_status'] = 'disabled-managed-route-removed' if owned else 'disabled-custom-routes-preserved'
+        return target, snippet, clean, None
+    path, origin = panel_route(state)
+    children = nginx_nodes(clean)
+    selected = next(n for n in children if n['start'] == server['start'])
+    custom_route = False
+    custom_redirect = False
+    for node in selected['children']:
+        words = node['words']
+        if words[0] == 'include':
+            raise RuntimeError('Custom TLS server includes require manual panel route configuration; nothing replaced')
+        if words[0] != 'location':
+            continue
+        if '~' in words[1] or words[1].startswith('@'):
+            raise RuntimeError('Custom regex/named locations require manual panel route configuration')
+        route = words[-1]
+        if route == '/':
+            continue
+        if route.rstrip('/') == path.rstrip('/') or route.startswith(path) or path.startswith(route.rstrip('/') + '/'):
+            directives = [c['words'] for c in node['children'] or []]
+            if (not owned and words == ['location', '=', path[:-1]]
+                    and directives == [['return', '308', path]]):
+                custom_redirect = True
+                continue
+            headers = {w[1]: w[2] for w in directives if len(w) == 3 and w[0] == 'proxy_set_header'}
+            if (not owned and route == path and (words == ['location', '^~', path] or words == ['location', path])
+                    and ['proxy_pass', origin] in directives
+                    and ['proxy_http_version', '1.1'] in directives
+                    and headers.get('Upgrade') == '$http_upgrade'
+                    and headers.get('Connection') in ('upgrade', '$connection_upgrade')
+                    and not any(w[0] in ('rewrite', 'return', 'proxy_pass_request_headers') for w in directives)):
+                custom_route = True
+                continue
+            raise RuntimeError('Custom location conflicts with the panel basePath; no routes replaced')
+    if custom_route:
+        state.update(panel_route_status='existing-custom-route-preserved',
+                     public_url='https://' + state['domain'] + path)
+        return target, snippet, text, None
+    if custom_redirect:
+        raise RuntimeError('Custom redirect exists without a compatible panel proxy; configure manually')
+    contents = route_snippet(state)
+    digest = hashlib.sha256(contents.encode()).hexdigest()
+    insertion = f'    # selfsteal-3xui-panel {digest}\n    include {snippet};\n'
+    close = selected['close']
+    clean = clean[:close] + insertion + clean[close:]
+    state.update(panel_route_status='enabled-managed-route', public_url='https://' + state['domain'] + path,
+                 script_exposed_public_admin=True)
+    return target, snippet, clean, contents
+
+
+def route_preflight(state):
+    plan_route(state)
+
+
+def publish(state):
+    plan = plan_route(state)
+    if not plan:
+        return
+    target, snippet, text, contents = plan
+    if contents is not None:
+        snippet.parent.mkdir(parents=True, exist_ok=True)
+        snippet.write_text(contents)
+        os.chmod(snippet, 0o600)
+        map_path = Path(state['panel_map'])
+        map_path.parent.mkdir(parents=True, exist_ok=True)
+        map_path.write_text(connection_map(state)[1])
+        os.chmod(map_path, 0o600)
+    elif state.get('panel_route_status') == 'disabled-managed-route-removed':
+        snippet.unlink()
+        Path(state['panel_map']).unlink()
+    if target.read_text() != text:
+        target.write_text(text)
 
 
 class API:
@@ -574,8 +780,10 @@ def export(state):
         'panel_url': state['panel_url'], 'username': state['panel_username'],
         'password': state['panel_password'], 'ssh_tunnel': tunnel,
         'browser_url': browser_url,
-        'public_panel_enabled': None if state.get('is_existing') else False,
-        'script_exposed_public_admin': False,
+        'public_panel_enabled': (None if state.get('is_existing') and state.get('panel_route_status') == 'disabled-custom-routes-preserved' else bool(state.get('public_url'))),
+        'public_url': state.get('public_url'),
+        'public_panel_status': state.get('panel_route_status', 'disabled'),
+        'script_exposed_public_admin': state.get('script_exposed_public_admin', False),
         'existing_panel': bool(state.get('is_existing'))})
     fd = os.open(result / 'client.txt', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w') as f:
@@ -590,7 +798,7 @@ def export(state):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'export', 'verify', 'rollback'])
+    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'export', 'verify', 'rollback', 'route_preflight', 'publish'])
     parser.add_argument('--state', required=True)
     args = parser.parse_args()
     os.umask(0o077)
@@ -700,6 +908,15 @@ if (( ! CHECK )) && [[ -e /etc/x-ui/x-ui.db ]]; then
   read -r -s -p 'Existing administrator password: ' PANEL_PASS; echo
   read -r -s -p 'Administrator two-factor code (optional): ' PANEL_2FA; echo
 fi
+PUBLIC_PANEL=n
+if (( ! CHECK )); then
+  read -r -p "Publish password-authenticated panel over HTTPS on $DOMAIN at its secret basePath? [Y/n]: " PUBLIC_PANEL
+  PUBLIC_PANEL=${PUBLIC_PANEL:-y}
+  [[ ${PUBLIC_PANEL,,} == y || ${PUBLIC_PANEL,,} == n ]] || fail 'Answer y or n.'
+  if [[ ${PUBLIC_PANEL,,} == y && $PANEL_USER == admin && $PANEL_PASS == admin ]]; then
+    fail 'Change default administrator credentials privately before publishing the existing panel.'
+  fi
+fi
 SECURITY=n
 if (( ! CHECK )); then
   read -r -p 'Manage firewall with UFW (deny incoming, allow outgoing) and enable SSH fail2ban? [Y/n]: ' SECURITY
@@ -707,12 +924,15 @@ if (( ! CHECK )); then
   [[ ${SECURITY,,} == y || ${SECURITY,,} == n ]] || fail 'Answer y or n.'
   if [[ ${SECURITY,,} == n ]]; then echo 'WARNING: firewall/fail2ban setup skipped. External port restriction is NOT verified or enforced.' >&2; fi
 fi
-export DOMAIN EMAIL SSH_PORTS PANEL_URL PANEL_USER PANEL_PASS PANEL_2FA SECURITY
+export DOMAIN EMAIL SSH_PORTS PANEL_URL PANEL_USER PANEL_PASS PANEL_2FA SECURITY PUBLIC_PANEL
 python3 - "$STATE" <<'PY'
 import json,os,sys
 ports=[int(p) for p in os.environ['SSH_PORTS'].split()]
 if not ports or any(p<1 or p>65535 for p in ports): sys.exit('Invalid SSH ports')
 s=dict(domain=os.environ['DOMAIN'],email=os.environ['EMAIL'],ssh_ports=sorted(set(ports)),panel_binary='/usr/local/x-ui/x-ui',panel_db='/etc/x-ui/x-ui.db',panel_url=os.environ['PANEL_URL'],panel_username=os.environ['PANEL_USER'],panel_password=os.environ['PANEL_PASS'],target_port=9443,allow_firewall=os.environ['SECURITY'].lower()=='y')
+s['publish_panel']=os.environ['PUBLIC_PANEL'].lower()=='y'
+s['panel_snippet']='/etc/nginx/snippets/selfsteal-3xui-panel-'+s['domain']+'.conf'
+s['panel_map']='/etc/nginx/conf.d/selfsteal-3xui-panel-'+s['domain']+'-map.conf'
 s['panel_two_factor_code']=os.environ['PANEL_2FA']
 with open(sys.argv[1],'w') as f: json.dump(s,f)
 os.chmod(sys.argv[1],0o600)
@@ -790,6 +1010,11 @@ elif any(re.search(r'listen\s+(?:\[::\]:)?80[^;]*default_server',body) and not r
 PY
 ) || fail 'Nginx site conflict. Existing files were not changed.'
 fi
+python3 - "$STATE" "$EXISTING_SITE" <<'PY'
+import json,sys
+p=sys.argv[1]; s=json.load(open(p)); s['nginx_site']=sys.argv[2]; json.dump(s,open(p,'w'))
+PY
+helper route_preflight
 python3 - "$EXISTING_SITE" <<'PY'
 import subprocess,sys
 for line in subprocess.check_output(['ss','-ltnpH'],text=True).splitlines():
@@ -828,7 +1053,12 @@ PY
 fi
 if (( CHECK )); then echo 'Read-only preflight passed. No packages, releases, services or production files changed.'; exit 0; fi
 printf '\nPlan: %s; self-steal443 ->127.0.0.1:9443; SSH ports:%s.\n' "$DOMAIN" "$SSH_PORTS"
-echo 'Preserve existing identities/admin; new panel loopback only. Install dependencies, obtain real certificate, configure nginx and3x-ui.'
+echo 'Preserve existing identities/admin and loopback panel listener. Install dependencies, obtain real certificate, configure nginx and3x-ui.'
+if [[ $(state_get publish_panel) == true ]]; then
+  echo "Publish password-authenticated panel only at its secret HTTPS basePath on $DOMAIN; no public2053 or domain-root admin route."
+else
+  echo 'Do not add a public panel route; remove only intact script-owned panel snippet/include. Custom routes remain.'
+fi
 echo 'On failure owned files/service states are restored; packages/certificates remain.'
 if (( STOCK_DEFAULT )); then echo 'Pristine distribution nginx default site will be disabled (backed up); custom sites remain untouched.'; fi
 read -r -p 'Type APPLY to confirm all mutations: ' ANSWER
@@ -849,6 +1079,13 @@ for svc in "${SERVICES[@]}"; do
   if systemctl is-enabled --quiet "$svc"; then WAS_ENABLED[$svc]=yes; fi
 done
 snapshot "$SITE"; snapshot "$LINK"
+if [[ -n $EXISTING_SITE ]]; then
+  ACTUAL_SITE=$(readlink -f "$EXISTING_SITE")
+  [[ $ACTUAL_SITE == "$SITE" ]] || snapshot "$ACTUAL_SITE"
+fi
+snapshot "$(state_get panel_snippet)"
+snapshot "$(state_get panel_map)"
+snapshot "$RESULT/access.json"
 snapshot /etc/nginx/conf.d/selfsteal-3xui-default.conf
 snapshot /etc/letsencrypt/renewal-hooks/deploy/selfsteal-3xui-nginx
 snapshot /etc/fail2ban/jail.d/selfsteal-3xui.conf
@@ -910,7 +1147,7 @@ PY
   helper bootstrap
   systemctl enable --now x-ui
 fi
-# Existing compatible site is retained byte-for-byte, including public admin route.
+# Preserve compatible site assets/custom routes; only the owned panel include changes.
 if [[ -n $EXISTING_SITE ]]; then
   ROOT=$(python3 - "$EXISTING_SITE" <<'PY'
 import re,sys
@@ -923,7 +1160,7 @@ PY
 else
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
   cat > "$SITE" <<NGINX_HTTP
-# Managed by selfsteal-3xui; public panel is intentionally not proxied.
+# Managed by selfsteal-3xui; panel routing uses a separately owned snippet.
 server {
     listen 80;
     listen [::]:80;
@@ -993,6 +1230,11 @@ server {
 }
 NGINX_TLS
 fi
+python3 - "$STATE" "${EXISTING_SITE:-$SITE}" <<'PY'
+import json,sys
+p=sys.argv[1]; s=json.load(open(p)); s['nginx_site']=sys.argv[2]; json.dump(s,open(p,'w'))
+PY
+helper publish
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 printf '#!/bin/sh\nset -eu\n/usr/sbin/nginx -t\n/bin/systemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/selfsteal-3xui-nginx
 chmod 755 /etc/letsencrypt/renewal-hooks/deploy/selfsteal-3xui-nginx
@@ -1044,6 +1286,16 @@ curl --fail --silent --show-error --max-time 30 --socks5-hostname "127.0.0.1:$SM
 kill "$SMOKE_PID"; wait "$SMOKE_PID" || true; SMOKE_PID=''
 echo "Checking the public HTTPS fallback for $DOMAIN..."
 curl --fail --silent --show-error --max-time 30 "https://$DOMAIN/" -o "$WORK/ordinary-https.html"
+if [[ $(state_get public_url) == https://* ]]; then
+  echo 'Checking the public panel HTTPS API route...'
+  curl --fail --silent --show-error --max-time 30 "$(state_get public_url)csrf-token" -o "$WORK/public-panel-csrf.json"
+  python3 - "$WORK/public-panel-csrf.json" <<'PY'
+import json,sys
+r=json.load(open(sys.argv[1]))
+if r.get('success') is not True or not isinstance(r.get('obj'),str) or not r['obj']:
+    sys.exit('Public panel route did not return a valid session CSRF token')
+PY
+fi
 # Independent trusted TLS and strict wrong/no-SNI proof through the public endpoint.
 python3 - "$DOMAIN" <<'PY'
 import socket,ssl,sys
@@ -1080,5 +1332,8 @@ import json,sys
 a=json.load(open(sys.argv[1]))
 print('SSH tunnel:',a['ssh_tunnel'])
 print('Open locally:',a['browser_url'])
+if a.get('public_url'):
+    print('Public HTTPS panel (secret path; password required):',a['public_url'])
+print('Public panel status:',a['public_panel_status'])
 PY
 SUCCESS=1
