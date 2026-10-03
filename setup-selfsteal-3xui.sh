@@ -828,6 +828,51 @@ if __name__ == '__main__':
     sys.exit(main())
 PANEL_PY
 }
+write_placeholder() {
+  python3 - "$DOMAIN" "$SITE_NAME" "$1" <<'PLACEHOLDER_PY'
+import html
+import os
+import secrets
+import sys
+
+# Все 10 шаблонов встроены: установка через curl не требует дополнительных файлов.
+TEMPLATES = {
+    "01-centered.html": "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{{SITE_NAME}}</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#fff;color:#111827;font-family:Inter,system-ui,-apple-system,\"Segoe UI\",sans-serif}main{width:min(560px,100%);text-align:center}.status{display:inline-flex;gap:8px;align-items:center;padding:7px 12px;border:1px solid #e5e7eb;border-radius:999px;color:#4b5563;font-size:14px}.dot{width:8px;height:8px;border-radius:50%;background:#22c55e}h1{margin:24px 0 12px;font-size:52px;letter-spacing:-.04em}p{margin:0;color:#6b7280}code{display:block;margin-top:28px;padding:14px;border:1px solid #e5e7eb;border-radius:10px;background:#f9fafb;color:#374151;overflow-wrap:anywhere}footer{margin-top:28px;color:#9ca3af;font-size:13px}h1,.brand,.eyebrow,small,p,footer,.endpoint{overflow-wrap:anywhere}main,.left,.right,.box,.content{min-width:0;max-width:100%}</style></head><body><main><div class=\"status\"><span class=\"dot\"></span>API online</div><h1>{{SITE_NAME}}</h1><p>Сервисный API-шлюз {{SITE_NAME}}.</p><code>{{SITE_URL}}</code><footer>{{SITE_NAME}}</footer></main></body></html>",
+    "02-card.html": "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{{SITE_NAME}}</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#f6f7f9;font-family:Inter,system-ui,sans-serif;color:#101828}.card{width:min(520px,100%);background:#fff;border:1px solid #eaecf0;border-radius:18px;padding:40px;box-shadow:0 12px 40px rgba(16,24,40,.06)}.badge{font-size:13px;color:#067647;background:#ecfdf3;display:inline-block;padding:6px 10px;border-radius:999px}h1{font-size:40px;margin:18px 0 8px;letter-spacing:-.03em}p{color:#667085;margin:0 0 26px}.endpoint{padding:13px 14px;border-radius:10px;background:#f9fafb;border:1px solid #eaecf0;font-family:monospace;color:#344054;overflow-wrap:anywhere}h1,.brand,.eyebrow,small,p,footer,.endpoint{overflow-wrap:anywhere}main,.left,.right,.box,.content{min-width:0;max-width:100%}</style></head><body><section class=\"card\"><div class=\"badge\">Operational</div><h1>{{SITE_NAME}}</h1><p>API endpoint is available and ready to accept requests.</p><div class=\"endpoint\">{{SITE_URL}}</div></section></body></html>",
+    "03-left.html": "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{{SITE_NAME}}</title><style>*{box-sizing:border-box}body{margin:0;background:#fff;color:#0f172a;font-family:Inter,system-ui,sans-serif}.wrap{min-height:100vh;display:flex;align-items:center;padding:8vw}main{max-width:680px}.eyebrow{text-transform:uppercase;letter-spacing:.14em;font-size:12px;color:#64748b}h1{font-size:64px;line-height:.95;letter-spacing:-.055em;margin:18px 0 20px}p{font-size:18px;line-height:1.6;color:#64748b;max-width:560px}.line{margin-top:32px;padding-top:22px;border-top:1px solid #e2e8f0;font-family:monospace;color:#334155;overflow-wrap:anywhere}h1,.brand,.eyebrow,small,p,footer,.endpoint{overflow-wrap:anywhere}main,.left,.right,.box,.content{min-width:0;max-width:100%}</style></head><body><div class=\"wrap\"><main><div class=\"eyebrow\">{{SITE_NAME}}</div><h1>{{SITE_NAME}}</h1><p>Служебная точка доступа к API {{SITE_NAME}}.</p><div class=\"line\">{{SITE_URL}}</div></main></div></body></html>",
+    "04-status-bar.html": "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{{SITE_NAME}}</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#fff;font-family:Inter,system-ui,sans-serif;color:#111827}header{height:58px;border-bottom:1px solid #eee;display:flex;align-items:center;justify-content:space-between;padding:0 28px;font-size:14px}.brand{font-weight:700}.ok{display:flex;align-items:center;gap:8px;color:#4b5563}.dot{width:8px;height:8px;border-radius:50%;background:#16a34a}main{min-height:calc(100vh - 58px);display:grid;place-items:center;padding:24px}.box{text-align:center;max-width:620px}h1{font-size:50px;margin:0 0 12px}p{color:#6b7280;margin:0}.endpoint{margin-top:28px;font-family:monospace;font-size:15px;color:#374151}h1,.brand,.eyebrow,small,p,footer,.endpoint{overflow-wrap:anywhere}main,.left,.right,.box,.content{min-width:0;max-width:100%}</style></head><body><header><div class=\"brand\">{{SITE_NAME}}</div><div class=\"ok\"><span class=\"dot\"></span>All systems operational</div></header><main><div class=\"box\"><h1>{{SITE_NAME}}</h1><p>Public service endpoint.</p><div class=\"endpoint\">{{SITE_URL}}</div></div></main></body></html>",
+    "05-mono.html": "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{{SITE_NAME}}</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#fafafa;color:#18181b;font-family:\"SFMono-Regular\",Consolas,monospace;padding:24px}main{width:min(700px,100%);border:1px solid #e4e4e7;background:#fff;padding:28px;border-radius:12px}.row{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}h1{font-size:20px;margin:0}.status{color:#15803d}pre{margin:28px 0 0;white-space:pre-wrap;word-break:break-word;color:#52525b;line-height:1.7}h1,.brand,.eyebrow,small,p,footer,.endpoint{overflow-wrap:anywhere}main,.left,.right,.box,.content{min-width:0;max-width:100%}</style></head><body><main><div class=\"row\"><h1>{{SITE_NAME}}</h1><div class=\"status\">200 OK</div></div><pre>service: online\nurl: {{SITE_URL}}\nprotocol: https</pre></main></body></html>",
+    "06-soft.html": "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{{SITE_NAME}}</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:linear-gradient(180deg,#ffffff 0%,#f5f7fb 100%);font-family:Inter,system-ui,sans-serif;color:#111827;padding:24px}main{text-align:center;max-width:620px}.mark{width:52px;height:52px;margin:0 auto 20px;border-radius:14px;background:#111827;color:#fff;display:grid;place-items:center;font-weight:700}h1{font-size:46px;margin:0 0 10px;letter-spacing:-.04em}p{color:#6b7280;margin:0 0 26px}.endpoint{display:inline-block;padding:11px 15px;border:1px solid #e5e7eb;border-radius:999px;background:rgba(255,255,255,.8);font-family:monospace;color:#374151}h1,.brand,.eyebrow,small,p,footer,.endpoint{overflow-wrap:anywhere}main,.left,.right,.box,.content{min-width:0;max-width:100%}</style></head><body><main><div class=\"mark\">{{SITE_INITIAL}}</div><h1>{{SITE_NAME}}</h1><p>Secure API service endpoint.</p><div class=\"endpoint\">{{SITE_URL}}</div></main></body></html>",
+    "07-outline.html": "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{{SITE_NAME}}</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#fff;font-family:Arial,sans-serif;color:#111;padding:24px}main{width:min(600px,100%);padding:38px;border:2px solid #111;border-radius:4px}small{font-size:12px;text-transform:uppercase;letter-spacing:.15em}h1{font-size:48px;margin:18px 0 14px}p{margin:0;color:#555;line-height:1.6}.endpoint{margin-top:28px;padding:12px 0;border-top:1px solid #bbb;font-family:monospace;overflow-wrap:anywhere}h1,.brand,.eyebrow,small,p,footer,.endpoint{overflow-wrap:anywhere}main,.left,.right,.box,.content{min-width:0;max-width:100%}</style></head><body><main><small>{{SITE_NAME}}</small><h1>{{SITE_NAME}}</h1><p>This host provides access to the {{SITE_NAME}} infrastructure.</p><div class=\"endpoint\">{{SITE_URL}}</div></main></body></html>",
+    "08-split.html": "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{{SITE_NAME}}</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#fff;font-family:Inter,system-ui,sans-serif;color:#111827}main{min-height:100vh;display:grid;grid-template-columns:1fr 1fr}.left,.right{padding:8vw;display:flex;flex-direction:column;justify-content:center}.left{border-right:1px solid #e5e7eb}h1{font-size:56px;line-height:1;margin:0 0 16px}p{color:#6b7280;line-height:1.6}.right{background:#fafafa}.label{font-size:13px;color:#6b7280;margin-bottom:10px}code{font-size:16px;overflow-wrap:anywhere}.status{margin-top:24px;color:#15803d}@media(max-width:700px){main{grid-template-columns:1fr}.left{border-right:0;border-bottom:1px solid #e5e7eb}}h1,.brand,.eyebrow,small,p,footer,.endpoint{overflow-wrap:anywhere}main,.left,.right,.box,.content{min-width:0;max-width:100%}</style></head><body><main><section class=\"left\"><h1>{{SITE_NAME}}</h1><p>Сервисный API-шлюз инфраструктуры {{SITE_NAME}}.</p></section><section class=\"right\"><div class=\"label\">Endpoint</div><code>{{SITE_URL}}</code><div class=\"status\">● Online</div></section></main></body></html>",
+    "09-topline.html": "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{{SITE_NAME}}</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#fff;font-family:Inter,system-ui,sans-serif;color:#0f172a}.top{height:5px;background:#0f172a}main{min-height:calc(100vh - 5px);display:grid;place-items:center;padding:24px}.content{max-width:620px;text-align:center}h1{font-size:50px;margin:0 0 12px;letter-spacing:-.04em}p{color:#64748b;margin:0}.meta{margin-top:30px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap}.meta span{padding:8px 11px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;color:#475569}.endpoint{font-family:monospace}h1,.brand,.eyebrow,small,p,footer,.endpoint{overflow-wrap:anywhere}main,.left,.right,.box,.content{min-width:0;max-width:100%}</style></head><body><div class=\"top\"></div><main><div class=\"content\"><h1>{{SITE_NAME}}</h1><p>Minimal service gateway.</p><div class=\"meta\"><span>Online</span><span class=\"endpoint\">{{SITE_URL}}</span></div></div></main></body></html>",
+    "10-ultra-minimal.html": "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{{SITE_NAME}}</title><style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#fff;color:#111;font-family:system-ui,-apple-system,\"Segoe UI\",sans-serif;padding:24px}main{text-align:center}h1{font-size:42px;margin:0 0 10px}p{margin:0;color:#777}code{display:block;margin-top:24px;color:#444;word-break:break-all}h1,.brand,.eyebrow,small,p,footer,.endpoint{overflow-wrap:anywhere}main,.left,.right,.box,.content{min-width:0;max-width:100%}</style></head><body><main><h1>{{SITE_NAME}}</h1><p>Service is running.</p><code>{{SITE_URL}}</code></main></body></html>"
+}
+
+def render(template, domain, name):
+    # Подстановка за один проход: введенное название не обрабатывается как шаблон.
+    import re
+    values = {
+        'SITE_NAME': html.escape(name, quote=True),
+        'SITE_URL': html.escape('https://' + domain, quote=True),
+        'SITE_INITIAL': html.escape(name[0], quote=True),
+    }
+    return re.sub(r'\{\{(SITE_NAME|SITE_URL|SITE_INITIAL)\}\}',
+                  lambda match: values[match[1]], template)
+
+if __name__ == '__main__':
+    domain, name, destination = sys.argv[1:]
+    selected = secrets.choice(list(TEMPLATES))
+    page = render(TEMPLATES[selected], domain, name)
+    # Не перезаписываем существующие файлы или символические ссылки.
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(page)
+    os.chmod(destination, 0o644)
+    print(selected)
+PLACEHOLDER_PY
+}
+
 state_get() { python3 - "$STATE" "$1" <<'PY'
 import json,sys
 v=json.load(open(sys.argv[1])).get(sys.argv[2], '')
@@ -886,6 +931,18 @@ s=sys.argv[1]
 if len(s)>253 or '.' not in s or not all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', x) for x in s.split('.')):
     sys.exit('Некорректное имя домена. Используйте форму ASCII/punycode.')
 PY
+SITE_NAME=''
+if (( ! CHECK )); then
+  read -r -p 'Название сайта для страницы-заглушки: ' SITE_NAME
+  SITE_NAME=$(python3 - "$SITE_NAME" <<'PY'
+import sys
+name = sys.argv[1].strip()
+if not name or len(name) > 120 or any(ord(c) < 32 or ord(c) == 127 for c in name):
+    sys.exit('Введите название длиной от 1 до 120 символов без управляющих символов.')
+print(name)
+PY
+)
+fi
 EMAIL=''
 if (( ! CHECK )); then read -r -p 'Email для Let’s Encrypt (необязательно): ' EMAIL; fi
 [[ -z $EMAIL || $EMAIL =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || fail 'Некорректный email.'
@@ -928,12 +985,13 @@ if (( ! CHECK )); then
   [[ ${SECURITY,,} == y || ${SECURITY,,} == n ]] || fail 'Введите y (да) или n (нет).'
   if [[ ${SECURITY,,} == n ]]; then echo 'ВНИМАНИЕ: настройка межсетевого экрана и fail2ban пропущена. Ограничение внешних портов не проверяется и не применяется.' >&2; fi
 fi
-export DOMAIN EMAIL SSH_PORTS PANEL_URL PANEL_USER PANEL_PASS PANEL_2FA SECURITY PUBLIC_PANEL
+export DOMAIN SITE_NAME EMAIL SSH_PORTS PANEL_URL PANEL_USER PANEL_PASS PANEL_2FA SECURITY PUBLIC_PANEL
 python3 - "$STATE" <<'PY'
 import json,os,sys
 ports=[int(p) for p in os.environ['SSH_PORTS'].split()]
 if not ports or any(p<1 or p>65535 for p in ports): sys.exit('Некорректные порты SSH')
 s=dict(domain=os.environ['DOMAIN'],email=os.environ['EMAIL'],ssh_ports=sorted(set(ports)),panel_binary='/usr/local/x-ui/x-ui',panel_db='/etc/x-ui/x-ui.db',panel_url=os.environ['PANEL_URL'],panel_username=os.environ['PANEL_USER'],panel_password=os.environ['PANEL_PASS'],target_port=9443,allow_firewall=os.environ['SECURITY'].lower()=='y')
+s['site_name']=os.environ['SITE_NAME']
 s['publish_panel']=os.environ['PUBLIC_PANEL'].lower()=='y'
 s['panel_snippet']='/etc/nginx/snippets/selfsteal-3xui-panel-'+s['domain']+'.conf'
 s['panel_map']='/etc/nginx/conf.d/selfsteal-3xui-panel-'+s['domain']+'-map.conf'
@@ -1057,6 +1115,9 @@ PY
 fi
 if (( CHECK )); then echo 'Проверка без изменений пройдена. Пакеты, версии программ, сервисы и рабочие файлы не изменены.'; exit 0; fi
 printf '\nПлан: %s; self-steal 443 -> 127.0.0.1:9443; порты SSH: %s.\n' "$DOMAIN" "$SSH_PORTS"
+if [[ -z $EXISTING_SITE ]]; then
+  printf 'Страница-заглушка: название «%s», адрес https://%s; случайный вариант из 10.\n' "$SITE_NAME" "$DOMAIN"
+fi
 echo 'Сохранить существующие идентификаторы, администратора и локальный адрес панели. Установить зависимости, получить сертификат, настроить nginx и 3x-ui.'
 if [[ $(state_get publish_panel) == true ]]; then
   echo "Опубликовать панель с входом по паролю только по секретному HTTPS basePath на $DOMAIN; без публичного порта 2053 и панели в корне домена."
@@ -1185,7 +1246,7 @@ if [[ -z $EXISTING_SITE ]]; then
   FRESH_ROOT=1
   mkdir -p "$ROOT/.well-known/acme-challenge"
   chmod 755 "$ROOT" "$ROOT/.well-known" "$ROOT/.well-known/acme-challenge"
-  printf '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Добро пожаловать</title><h1>Добро пожаловать</h1></html>\n' > "$ROOT/index.html"
+  PLACEHOLDER_TEMPLATE=$(write_placeholder "$ROOT/index.html")
   chmod 644 "$ROOT/index.html"
 else
   [[ -d $ROOT/.well-known/acme-challenge ]] || fail 'Существующий корневой каталог ACME отсутствует; создайте его вручную без изменения прав сайта и его файлов.'
@@ -1326,6 +1387,7 @@ qrencode -t UTF8 -o "$RESULT/client-qr.txt" < "$RESULT/client.txt"
 cp "$STATE" "$BACKUP/final-state.json"; chmod 600 "$BACKUP/final-state.json"
 chmod 600 "$RESULT"/*
 echo "Настройка проверена. Закрытые результаты: $RESULT; резервная копия: $BACKUP"
+if (( FRESH_ROOT )); then echo "Страница-заглушка: $ROOT/index.html; шаблон: $PLACEHOLDER_TEMPLATE"; fi
 echo "Фактический выходной IP прокси: $(cat "$RESULT/proxy-exit-ip.txt")"
 echo 'Ссылка клиента VLESS (секретная; не публикуйте):'
 cat "$RESULT/client.txt"
