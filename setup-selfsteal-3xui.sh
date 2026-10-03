@@ -10,48 +10,48 @@ DOMAIN=''
 while (( $# )); do
   case $1 in
     --help|-h) cat <<'HELP'
-Usage: sudo bash setup-selfsteal-3xui.sh [--check [--domain HOSTNAME]]
-Interactive Ubuntu/Debian systemd setup; no environment variables required.
---check performs read-only inspection and DNS/conflict checks without credentials.
-Missing preflight utilities can be installed with separate explicit consent.
-These packages are retained if later validation fails; --check never installs.
-Existing3x-ui administrators/clients are preserved. Panels stay loopback-only;
-HTTPS panel access on the entered domain is offered by default at a secret path.
-Private results/backups are saved under /root/selfsteal-3xui/.
+Использование: sudo bash setup-selfsteal-3xui.sh [--check [--domain ДОМЕН]]
+Интерактивная настройка Ubuntu/Debian с systemd; переменные окружения задавать не нужно.
+--check проверяет систему, DNS и конфликты без изменений и запроса учетных данных.
+Недостающие утилиты предварительной проверки устанавливаются только после отдельного подтверждения.
+При последующих ошибках эти пакеты сохраняются; --check ничего не устанавливает.
+Администраторы и клиенты существующей 3x-ui сохраняются. Панель слушает только локальный адрес;
+по умолчанию предлагается доступ к панели по HTTPS на введенном домене через секретный путь.
+Закрытые результаты и резервные копии сохраняются в /root/selfsteal-3xui/.
 HELP
       exit 0 ;;
     --check) CHECK=1; shift ;;
-    --domain) [[ $# -ge 2 ]] || { echo 'Missing domain' >&2; exit 2; }; DOMAIN=$2; shift 2 ;;
-    *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
+    --domain) [[ $# -ge 2 ]] || { echo 'Не указан домен' >&2; exit 2; }; DOMAIN=$2; shift 2 ;;
+    *) printf 'Неизвестный аргумент: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
-[[ -z $DOMAIN || $CHECK == 1 ]] || { echo '--domain is only supported with --check' >&2; exit 2; }
-fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-[[ $EUID == 0 ]] || fail 'Run with sudo bash.'
-[[ -r /etc/os-release ]] || fail 'Missing OS identification.'
+[[ -z $DOMAIN || $CHECK == 1 ]] || { echo '--domain поддерживается только вместе с --check' >&2; exit 2; }
+fail() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
+[[ $EUID == 0 ]] || fail 'Запустите скрипт через sudo bash.'
+[[ -r /etc/os-release ]] || fail 'Не найден файл с информацией об операционной системе.'
 . /etc/os-release
-[[ $ID == ubuntu || $ID == debian ]] || fail 'Only Ubuntu and Debian are supported.'
-[[ -d /run/systemd/system ]] || fail 'A running systemd host is required.'
-command -v systemctl >/dev/null || fail 'systemctl is missing; only a running systemd host is supported.'
-(( CHECK )) || [[ -t 0 ]] || fail 'An interactive terminal is required.'
+[[ $ID == ubuntu || $ID == debian ]] || fail 'Поддерживаются только Ubuntu и Debian.'
+[[ -d /run/systemd/system ]] || fail 'Требуется система с работающим systemd.'
+command -v systemctl >/dev/null || fail 'Не найден systemctl; требуется система с работающим systemd.'
+(( CHECK )) || [[ -t 0 ]] || fail 'Требуется интерактивный терминал.'
 PREFLIGHT_PACKAGES=()
 command -v python3 >/dev/null || PREFLIGHT_PACKAGES+=(python3)
 if ! command -v ss >/dev/null || ! command -v ip >/dev/null; then PREFLIGHT_PACKAGES+=(iproute2); fi
 command -v flock >/dev/null || PREFLIGHT_PACKAGES+=(util-linux)
 if (( ${#PREFLIGHT_PACKAGES[@]} )); then
-  (( ! CHECK )) || fail "Read-only check cannot proceed: missing preflight packages: ${PREFLIGHT_PACKAGES[*]}. No package installation attempted."
-  command -v apt-get >/dev/null || fail 'apt-get is unavailable on this system.'
-  printf 'Minimal preflight utilities are missing. Install ONLY: %s\n' "${PREFLIGHT_PACKAGES[*]}"
-  echo 'This preliminary installation does not configure nginx/panel/firewall. Packages are retained, not rolled back, if any later preflight/setup fails.'
-  read -r -p 'Type INSTALL PREFLIGHT PACKAGES to consent (otherwise cancel): ' ANSWER
-  [[ $ANSWER == 'INSTALL PREFLIGHT PACKAGES' ]] || fail 'Cancelled before dependency installation.'
+  (( ! CHECK )) || fail "Проверка без изменений невозможна: отсутствуют пакеты ${PREFLIGHT_PACKAGES[*]}. Установка пакетов не выполнялась."
+  command -v apt-get >/dev/null || fail 'В системе отсутствует apt-get.'
+  printf 'Отсутствуют утилиты предварительной проверки. Установить только: %s\n' "${PREFLIGHT_PACKAGES[*]}"
+  echo 'Предварительная установка не настраивает nginx, панель и межсетевой экран. При последующих ошибках проверки или настройки установленные пакеты сохраняются.'
+  read -r -p 'Для подтверждения введите INSTALL PREFLIGHT PACKAGES (иначе отмена): ' ANSWER
+  [[ $ANSWER == 'INSTALL PREFLIGHT PACKAGES' ]] || fail 'Отменено до установки зависимостей.'
   DEBIAN_FRONTEND=noninteractive apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PREFLIGHT_PACKAGES[@]}"
-  for command in python3 ss ip flock; do command -v "$command" >/dev/null || fail "Preflight utility $command still unavailable after package installation."; done
+  for command in python3 ss ip flock; do command -v "$command" >/dev/null || fail "Утилита $command по-прежнему недоступна после установки пакетов."; done
 fi
 # Lock an existing inode: even --check creates no lock file.
 exec 9</etc/os-release
-flock -n 9 || fail 'Another setup is running.'
+flock -n 9 || fail 'Уже запущен другой экземпляр настройки.'
 WORK=$(mktemp -d /tmp/selfsteal-3xui.XXXXXXXX)
 STATE=$WORK/state.json
 PANEL_HELPER=$WORK/panel.py
@@ -121,14 +121,14 @@ def run(args, state):
     p = subprocess.run(args, env=env, cwd=Path(state['panel_binary']).parent,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode:
-        raise RuntimeError('3x-ui CLI operation failed (output withheld to protect secrets)')
+        raise RuntimeError('Ошибка команды 3x-ui (вывод скрыт для защиты секретных данных)')
     return p.stdout
 
 
 def require_version(state):
     version = run([state['panel_binary'], '-v'], state).strip().removeprefix('v')
     if version != VERSION:
-        raise RuntimeError('Unsupported 3x-ui version: only verified 3.8.5 is supported; no upgrade performed')
+        raise RuntimeError('Неподдерживаемая версия 3x-ui: поддерживается только проверенная 3.8.5; обновление не выполнялось')
     state['panel_version'] = version
 
 
@@ -140,7 +140,7 @@ def inspect(state):
     exists = Path(state['panel_db']).exists()
     binary = Path(state['panel_binary']).exists()
     if exists != binary:
-        raise RuntimeError('Partial 3x-ui installation detected; resolve it before setup')
+        raise RuntimeError('Обнаружена неполная установка 3x-ui; исправьте ее перед настройкой')
     state['is_existing'] = exists
     matches = []
     if exists:
@@ -152,18 +152,18 @@ def inspect(state):
         for row in inbounds:
             stream = parse(row['stream_settings'])
             if row['protocol'] != 'vless' or stream.get('security') != 'reality':
-                raise RuntimeError('Existing local panel inbound443 is incompatible; nothing changed')
+                raise RuntimeError('Существующее локальное входящее подключение панели на порту 443 несовместимо; изменений нет')
             if stream.get('network') not in ('tcp', 'raw'):
-                raise RuntimeError('Existing Reality443 transport is not TCP/raw; migration would break clients')
+                raise RuntimeError('Существующее подключение Reality на порту 443 использует транспорт, отличный от TCP/raw; перенос нарушит работу клиентов')
             if row.get('disable_flow'):
-                raise RuntimeError('Existing inbound disables all client flows; cannot add Vision without changing old clients')
+                raise RuntimeError('В существующем входящем подключении отключены все flow клиентов; нельзя добавить Vision без изменения старых клиентов')
             matches.append(row)
         if len(matches) > 1:
-            raise RuntimeError('Multiple local443 inbounds require manual reconciliation')
+            raise RuntimeError('Несколько локальных входящих подключений на порту 443 требуют ручного согласования')
         if settings.get('webListen', '') not in ('127.0.0.1', '::1'):
-            raise RuntimeError('Existing panel is not loopback-only. Restrict its listener explicitly before setup; admin settings will not be changed')
+            raise RuntimeError('Существующая панель слушает внешний адрес. Ограничьте ее локальным адресом перед настройкой; параметры администратора не изменяются')
         if any(settings.get(k, 'false') == 'true' for k in ('subEnable', 'subJsonEnable', 'subClashEnable')) and settings.get('subListen', '') not in ('127.0.0.1', '::1'):
-            raise RuntimeError('Existing subscription listener is public; restrict explicitly before setup')
+            raise RuntimeError('Существующий сервис подписок слушает внешний адрес; ограничьте его локальным адресом перед настройкой')
         host = settings['webListen']
         host = '[' + host + ']' if ':' in host else host
         scheme = 'https' if settings.get('webCertFile') and settings.get('webKeyFile') else 'http'
@@ -172,7 +172,7 @@ def inspect(state):
             base_path += '/'
         detected_url = '%s://%s:%s%s' % (scheme, host, settings.get('webPort', '2053'), base_path)
         if state.get('panel_url') and state['panel_url'].rstrip('/') != detected_url.rstrip('/'):
-            raise RuntimeError('Entered panel URL does not match the installed loopback listener/basePath')
+            raise RuntimeError('Введенный URL панели не совпадает с настроенным локальным адресом или basePath')
         state['panel_url'] = detected_url
         if state.get('publish_panel'):
             panel_route(state)
@@ -185,15 +185,15 @@ def inspect(state):
             state['panel_port'], secrets.token_urlsafe(24))
     ss = subprocess.run(['ss', '-H', '-ltnp', 'sport = :443'], capture_output=True, text=True, check=True).stdout
     if ss.strip() and not matches:
-        raise RuntimeError('TCP443 is occupied outside a compatible local3x-ui Reality inbound; no service will be killed')
+        raise RuntimeError('TCP 443 занят сервисом, отличным от совместимого локального подключения Reality в 3x-ui; сервисы не будут остановлены')
     if ss.strip() and any('xray' not in line.lower() for line in ss.splitlines()):
-        raise RuntimeError('TCP443 listener owner is not verifiably Xray; refusing takeover')
+        raise RuntimeError('Не удалось подтвердить, что TCP 443 занят Xray; перехват порта отменен')
 
 
 def bcrypt_password(password):
     libname = ctypes.util.find_library('crypt')
     if not libname:
-        raise RuntimeError('libcrypt with bcrypt support is required for secure bootstrap')
+        raise RuntimeError('Для безопасной первоначальной настройки требуется libcrypt с поддержкой bcrypt')
     lib = ctypes.CDLL(libname)
     lib.crypt.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
     lib.crypt.restype = ctypes.c_char_p
@@ -202,13 +202,13 @@ def bcrypt_password(password):
     salt = ''.join(secrets.choice(alphabet) for _ in range(21)) + secrets.choice('.Oeu')
     hashed = lib.crypt(password.encode(), ('$2b$12$' + salt).encode())
     if not hashed or not hashed.startswith(b'$2b$12$') or len(hashed) != 60:
-        raise RuntimeError('System libcrypt cannot generate bcrypt; safe bootstrap stopped')
+        raise RuntimeError('Системная libcrypt не может создать bcrypt; безопасная первоначальная настройка остановлена')
     return hashed.decode()
 
 
 def bootstrap(state):
     if state.get('is_existing') or Path(state['panel_db']).exists():
-        raise RuntimeError('Bootstrap is fresh-only; existing credentials will never be reset')
+        raise RuntimeError('Первоначальная настройка доступна только для новой установки; существующие учетные данные не сбрасываются')
     require_version(state)
     port = int(state.get('panel_port', 2053))
     with socket.socket() as sock:
@@ -224,7 +224,7 @@ def bootstrap(state):
     os.chmod(state['panel_db'], 0o600)
     with sqlite3.connect(state['panel_db']) as db:
         if db.execute('SELECT count(*) FROM users').fetchone()[0] != 1:
-            raise RuntimeError('Unexpected fresh administrator count; service must remain stopped')
+            raise RuntimeError('Неожиданное число администраторов новой установки; сервис должен оставаться остановленным')
         db.execute('UPDATE users SET username=?, password=?', (username, hashed))
         for key, value in {'webListen': '127.0.0.1', 'webPort': str(port), 'webBasePath': path,
                            'subEnable': 'false', 'subJsonEnable': 'false', 'subClashEnable': 'false',
@@ -235,7 +235,7 @@ def bootstrap(state):
                 db.execute('INSERT INTO settings(key,value) VALUES (?,?)', (key, value))
         saved = dict(db.execute('SELECT key,value FROM settings'))
         if saved['webListen'] != '127.0.0.1' or any(saved[k] != 'false' for k in ('subEnable', 'subJsonEnable', 'subClashEnable')):
-            raise RuntimeError('Fresh bootstrap safety verification failed')
+            raise RuntimeError('Проверка безопасности первоначальной настройки не пройдена')
     state.update(panel_username=username, panel_password=password, panel_port=port,
                  panel_url='http://127.0.0.1:%d%s' % (port, path), bootstrap_complete=True)
 
@@ -245,9 +245,9 @@ def panel_route(state):
     if (panel.scheme not in ('http', 'https') or not panel.hostname
             or not ipaddress.ip_address(panel.hostname).is_loopback
             or panel.username or panel.password or panel.query or panel.fragment):
-        raise RuntimeError('Public panel upstream must be a literal loopback URL')
+        raise RuntimeError('Адрес назначения публичного маршрута панели должен содержать локальный IP-адрес')
     if not re.fullmatch(r'/[A-Za-z0-9_-]{20,128}/', panel.path):
-        raise RuntimeError('Public panel requires a unique random basePath (20+ URL-safe characters). Set it manually in 3x-ui over the SSH tunnel, then rerun; no panel settings were changed')
+        raise RuntimeError('Для публикации панели требуется уникальный случайный basePath (от 20 символов, безопасных для URL). Задайте его вручную в 3x-ui через SSH-туннель и повторите запуск; настройки панели не изменены')
     origin = urllib.parse.urlunsplit((panel.scheme, panel.netloc, '', '', ''))
     return panel.path, origin
 
@@ -259,16 +259,16 @@ def nginx_nodes(text):
     end = 0
     for m in pattern.finditer(text):
         if m.start() != end:
-            raise RuntimeError('Cannot safely parse custom nginx syntax')
+            raise RuntimeError('Не удалось безопасно разобрать пользовательскую конфигурацию nginx')
         end = m.end()
         raw = m.group()
         if raw.isspace() or raw.startswith('#'):
             continue
         if '\\' in raw:
-            raise RuntimeError('Escaped nginx syntax requires manual route configuration')
+            raise RuntimeError('Экранирование в конфигурации nginx требует ручной настройки маршрута')
         tokens.append((raw.strip('"\''), m.start(), m.end()))
     if end != len(text):
-        raise RuntimeError('Cannot safely parse custom nginx syntax')
+        raise RuntimeError('Не удалось безопасно разобрать пользовательскую конфигурацию nginx')
     pos = 0
     def block(nested=False):
         nonlocal pos
@@ -276,7 +276,7 @@ def nginx_nodes(text):
         while pos < len(tokens):
             if tokens[pos][0] == '}':
                 if not nested:
-                    raise RuntimeError('Unexpected nginx closing brace')
+                    raise RuntimeError('Неожиданная закрывающая скобка в конфигурации nginx')
                 close = tokens[pos][1]
                 pos += 1
                 return nodes, close
@@ -286,14 +286,14 @@ def nginx_nodes(text):
                 words.append(tokens[pos][0])
                 pos += 1
             if not words or pos == len(tokens) or tokens[pos][0] == '}':
-                raise RuntimeError('Incomplete nginx directive')
+                raise RuntimeError('Незавершенная директива nginx')
             delimiter = tokens[pos]
             pos += 1
             children, close = block(True) if delimiter[0] == '{' else (None, delimiter[1])
             finish = tokens[pos - 1][2]
             nodes.append(dict(words=words, children=children, start=start, end=finish, close=close))
         if nested:
-            raise RuntimeError('Unclosed nginx block')
+            raise RuntimeError('Незакрытый блок nginx')
         return nodes, len(text)
     return block()[0]
 
@@ -332,7 +332,7 @@ def plan_route(state):
     state['script_exposed_public_admin'] = False
     if not site:
         if any(Path(state[k]).exists() or Path(state[k]).is_symlink() for k in ('panel_snippet', 'panel_map')):
-            raise RuntimeError('Managed panel file exists without a domain TLS site; inspect manually')
+            raise RuntimeError('Управляемый файл панели существует без TLS-сайта домена; проверьте вручную')
         return None
     target = Path(site).resolve(strict=True)
     text = target.read_text()
@@ -341,28 +341,28 @@ def plan_route(state):
                and any(c['words'][0] == 'server_name' and state['domain'] in c['words'][1:] for c in n['children'])
                and any(c['words'][0] == 'listen' and '127.0.0.1:9443' in c['words'] and 'ssl' in c['words'] and 'proxy_protocol' in c['words'] for c in n['children'])]
     if len(servers) != 1:
-        raise RuntimeError('Cannot select exactly one domain TLS server for panel routing')
+        raise RuntimeError('Не удалось однозначно выбрать TLS-сервер домена для маршрута панели')
     server = servers[0]
     snippet = Path(state['panel_snippet'])
     marker = re.compile(r'(?m)^    # selfsteal-3xui-panel ([0-9a-f]{64})\n    include ' + re.escape(str(snippet)) + r';\n')
     owned = list(marker.finditer(text))
     if len(owned) > 1:
-        raise RuntimeError('Duplicate managed panel includes')
+        raise RuntimeError('Обнаружены дубликаты управляемых include панели')
     if owned:
         m = owned[0]
         if not (server['start'] < m.start() < m.end() < server['end']) or not snippet.is_file() or snippet.is_symlink():
-            raise RuntimeError('Managed panel include/snippet ownership is inconsistent')
+            raise RuntimeError('Нарушена связь управляемого include панели с ее фрагментом конфигурации')
         contents = snippet.read_bytes()
         if hashlib.sha256(contents).hexdigest() != m[1] or not contents.startswith(('# Managed by selfsteal-3xui: ' + state['domain'] + '\n').encode()):
-            raise RuntimeError('Managed panel snippet was customized; refusing to replace/remove it')
+            raise RuntimeError('Управляемый фрагмент панели изменен вручную; замена или удаление отменены')
         if map_path.is_symlink() or not map_path.is_file() or map_path.read_text() != map_contents:
-            raise RuntimeError('Managed WebSocket map was customized or removed; refusing mutation')
+            raise RuntimeError('Управляемый WebSocket map изменен или удален вручную; изменения отменены')
         clean = text[:m.start()] + text[m.end():]
     else:
         if snippet.exists() or snippet.is_symlink():
-            raise RuntimeError('Panel snippet exists without its owned include; inspect manually')
+            raise RuntimeError('Фрагмент панели существует без связанного include; проверьте вручную')
         if map_path.exists() or map_path.is_symlink():
-            raise RuntimeError('WebSocket map exists without its owned panel include; inspect manually')
+            raise RuntimeError('WebSocket map существует без связанного include панели; проверьте вручную')
         clean = text
     if not state.get('publish_panel'):
         # Custom public routes are deliberately outside our ownership.
@@ -376,11 +376,11 @@ def plan_route(state):
     for node in selected['children']:
         words = node['words']
         if words[0] == 'include':
-            raise RuntimeError('Custom TLS server includes require manual panel route configuration; nothing replaced')
+            raise RuntimeError('Пользовательские include TLS-сервера требуют ручной настройки маршрута панели; замены не выполнялись')
         if words[0] != 'location':
             continue
         if '~' in words[1] or words[1].startswith('@'):
-            raise RuntimeError('Custom regex/named locations require manual panel route configuration')
+            raise RuntimeError('Пользовательские регулярные или именованные location требуют ручной настройки маршрута панели')
         route = words[-1]
         if route == '/':
             continue
@@ -399,13 +399,13 @@ def plan_route(state):
                     and not any(w[0] in ('rewrite', 'return', 'proxy_pass_request_headers') for w in directives)):
                 custom_route = True
                 continue
-            raise RuntimeError('Custom location conflicts with the panel basePath; no routes replaced')
+            raise RuntimeError('Пользовательский location конфликтует с basePath панели; маршруты не заменены')
     if custom_route:
         state.update(panel_route_status='existing-custom-route-preserved',
                      public_url='https://' + state['domain'] + path)
         return target, snippet, text, None
     if custom_redirect:
-        raise RuntimeError('Custom redirect exists without a compatible panel proxy; configure manually')
+        raise RuntimeError('Пользовательское перенаправление существует без совместимого прокси панели; настройте вручную')
     contents = route_snippet(state)
     digest = hashlib.sha256(contents.encode()).hexdigest()
     insertion = f'    # selfsteal-3xui-panel {digest}\n    include {snippet};\n'
@@ -445,7 +445,7 @@ class API:
         self.base = state['panel_url'].rstrip('/') + '/'
         url = urllib.parse.urlsplit(self.base)
         if url.scheme not in ('http', 'https') or not url.hostname or not ipaddress.ip_address(url.hostname).is_loopback or url.username or url.password or url.query or url.fragment:
-            raise RuntimeError('Panel API URL must be a literal loopback origin and basePath')
+            raise RuntimeError('URL API панели должен содержать локальный IP-адрес и basePath')
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
         self.token = None
         self.token = self.call('csrf-token')
@@ -466,9 +466,9 @@ class API:
             with self.opener.open(req, timeout=30) as response:
                 obj = json.load(response)
         except Exception:
-            raise RuntimeError('Panel API request failed at ' + path + ' (credentials/configuration withheld)') from None
+            raise RuntimeError('Ошибка запроса API панели: ' + path + ' (учетные данные и конфигурация скрыты)') from None
         if not obj.get('success'):
-            raise RuntimeError('Panel API rejected ' + path + ' (response withheld)')
+            raise RuntimeError('API панели отклонил запрос: ' + path + ' (ответ скрыт)')
         return obj.get('obj')
 
     def list(self):
@@ -481,7 +481,7 @@ class API:
 def public_key(private):
     key = base64.urlsafe_b64decode(private + '=' * (-len(private) % 4))
     if len(key) != 32:
-        raise RuntimeError('Reality private key is not a32-byte X25519 key')
+        raise RuntimeError('Закрытый ключ Reality не является 32-байтовым ключом X25519')
     # RFC8410 PKCS8/SPKI encoding. OpenSSL receives private material only on
     # stdin, never in argv, environment, a temporary file, or diagnostics.
     der = bytes.fromhex('302e020100300506032b656e04220420') + key
@@ -489,20 +489,20 @@ def public_key(private):
                             input=der, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     prefix = bytes.fromhex('302a300506032b656e032100')
     if result.returncode or not result.stdout.startswith(prefix) or len(result.stdout) != len(prefix) + 32:
-        raise RuntimeError('OpenSSL X25519 public-key derivation failed')
+        raise RuntimeError('Не удалось получить открытый ключ X25519 через OpenSSL')
     return base64.urlsafe_b64encode(result.stdout[len(prefix):]).decode().rstrip('=')
 
 
 def pick(inbounds):
     matches = [i for i in inbounds if i.get('port') == 443 and not i.get('nodeId')]
     if len(matches) > 1:
-        raise RuntimeError('Multiple local443 inbounds are unsupported')
+        raise RuntimeError('Несколько локальных входящих подключений на порту 443 не поддерживаются')
     if matches and (matches[0]['protocol'] != 'vless' or parse(matches[0]['streamSettings']).get('security') != 'reality'):
-        raise RuntimeError('Local443 inbound is incompatible')
+        raise RuntimeError('Локальное входящее подключение на порту 443 несовместимо')
     if matches and parse(matches[0]['streamSettings']).get('network') not in ('tcp', 'raw'):
-        raise RuntimeError('Existing Reality443 transport is not TCP/raw; migration would break clients')
+        raise RuntimeError('Существующее подключение Reality на порту 443 использует транспорт, отличный от TCP/raw; перенос нарушит работу клиентов')
     if matches and matches[0].get('disableFlow'):
-        raise RuntimeError('Existing inbound disables all client flows; cannot add Vision without changing old clients')
+        raise RuntimeError('В существующем входящем подключении отключены все flow клиентов; нельзя добавить Vision без изменения старых клиентов')
     return matches[0] if matches else None
 
 
@@ -534,7 +534,7 @@ def client_update_payload(snapshot):
     allowed = record.get('allowedIPs') or []
     allowed = json.loads(allowed) if isinstance(allowed, str) else allowed
     if not isinstance(allowed, list) or any(not isinstance(ip, str) for ip in allowed):
-        raise RuntimeError('Canonical allowedIPs does not match verified model.Client schema')
+        raise RuntimeError('Поле allowedIPs не соответствует проверенной схеме model.Client')
     result['allowedIPs'] = allowed
     reverse = record.get('reverse') or None
     result['reverse'] = parse(reverse) if isinstance(reverse, str) else reverse
@@ -560,7 +560,7 @@ def snapshot_clients(api, inbound):
             snapshot = canonical_client(api, client['email'])
             client_update_payload(snapshot)  # Validate rollback schema before mutation.
             if not client.get('flow') and snapshot['client'].get('flow') == 'xtls-rprx-vision':
-                raise RuntimeError('Empty inbound flow conflicts with canonical intended Vision flow; resolve explicitly before setup')
+                raise RuntimeError('Пустой flow входящего подключения конфликтует с требуемым flow Vision; исправьте перед настройкой')
             snapshots.append(snapshot)
     return snapshots
 
@@ -587,7 +587,7 @@ def configure(state, save):
         stream = parse(inbound['streamSettings'])
         reality = stream.get('realitySettings', {})
         if not reality.get('privateKey') or not reality.get('shortIds'):
-            raise RuntimeError('Existing Reality key/shortIds missing; will not regenerate identities')
+            raise RuntimeError('Отсутствует существующий ключ Reality или shortIds; идентификаторы не будут созданы заново')
     else:
         private = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('=')
         settings = {'clients': [{'id': str(uuid.uuid4()), 'flow': 'xtls-rprx-vision', 'email': 'selfsteal-' + secrets.token_hex(5), 'enable': True, 'limitIp': 0, 'totalGB': 0, 'expiryTime': 0, 'subId': secrets.token_hex(8), 'reset': 0}], 'decryption': 'none', 'fallbacks': []}
@@ -610,7 +610,7 @@ def configure(state, save):
         created_client = added[0]
         existing_clients = api.call('panel/api/clients/list') or []
         if any(c.get('email') == created_client['email'] or c.get('uuid') == created_client['id'] for c in existing_clients):
-            raise RuntimeError('New script client identity collision; nothing changed')
+            raise RuntimeError('Конфликт идентификатора нового клиента скрипта; изменений нет')
         state['panel_rollback']['created_client'] = {
             'email': created_client['email'], 'uuid': created_client['id'],
             'subId': created_client['subId']}
@@ -672,7 +672,7 @@ def rollback(state):
             if (len(candidates) != 1 or candidate.get('uuid') != created_client['uuid']
                     or candidate.get('subId') != created_client['subId']
                     or any(i != owned_id for i in candidate.get('inboundIds') or [])):
-                raise RuntimeError('Created-client ownership changed; refusing destructive rollback cleanup')
+                raise RuntimeError('Принадлежность созданного клиента изменилась; удаление при откате отменено')
             # Proven ClientService.Delete endpoint removes this unique global
             # record and its associations. No preexisting client is targeted.
             api.call('panel/api/clients/del/' + urllib.parse.quote(created_client['email'], safe=''), {})
@@ -701,7 +701,7 @@ def checked_uri(api, state, inbound):
     settings = parse(inbound['settings'])
     active = [c for c in settings['clients'] if c.get('flow') == 'xtls-rprx-vision' and client_active(c, inbound)]
     if not active:
-        raise RuntimeError('No active client is available for export and smoke')
+        raise RuntimeError('Нет активного клиента для экспорта и проверки подключения')
     reality = parse(inbound['streamSettings'])['realitySettings']
     expected_key = public_key(reality['privateKey'])
     links = api.call('panel/api/inbounds/allLinks') or []
@@ -717,7 +717,7 @@ def checked_uri(api, state, inbound):
             if not q.get('fp'):
                 continue
             return link, client, q
-    raise RuntimeError('Actual panel link generator did not produce the required domain/Vision/Reality identity; refusing fabricated export')
+    raise RuntimeError('Генератор ссылок панели не вернул требуемые параметры домена, Vision и Reality; искусственный экспорт отменен')
 
 
 def verify(state):
@@ -725,12 +725,12 @@ def verify(state):
     api = API(state)
     inbound = pick(api.list())
     if not inbound or inbound['id'] != state.get('inbound_id'):
-        raise RuntimeError('Configured local443 inbound not found')
+        raise RuntimeError('Настроенное локальное входящее подключение на порту 443 не найдено')
     stream = parse(inbound['streamSettings'])
     reality = stream['realitySettings']
     target = '127.0.0.1:%d' % int(state.get('target_port', 9443))
     if stream.get('network') != 'tcp' or reality.get('target') != target or reality.get('xver') != 1 or reality.get('serverNames') != [state['domain']] or inbound.get('shareAddrStrategy') != 'custom' or inbound.get('shareAddr') != state['domain']:
-        raise RuntimeError('Panel API Reality configuration verification failed')
+        raise RuntimeError('Проверка конфигурации Reality через API панели не пройдена')
     checked_uri(api, state, inbound)
     # Runtime file is the consumed bundled-Xray configuration, not just DB state.
     runtime_path = Path(state.get('runtime_config', str(Path(state['panel_binary']).parent / 'bin/config.json')))
@@ -760,11 +760,11 @@ def verify(state):
             pass
         time.sleep(1)
     else:
-        raise RuntimeError('Bundled Xray consumed configuration does not match preserved API identities')
+        raise RuntimeError('Конфигурация, используемая встроенным Xray, не совпадает с сохраненными идентификаторами API')
     if not state.get('is_existing'):
         settings = api.call('panel/api/setting/all', {})
         if settings.get('webListen') != '127.0.0.1' or any(settings.get(k) for k in ('subEnable', 'subJsonEnable', 'subClashEnable')):
-            raise RuntimeError('Fresh panel listener/subscription safety verification failed')
+            raise RuntimeError('Проверка безопасности адресов панели и подписок новой установки не пройдена')
     return api, inbound
 
 
@@ -819,7 +819,7 @@ def main():
         save()
     except Exception as exc:
         save()
-        print('Panel helper: ' + str(exc), file=sys.stderr)
+        print('Помощник панели: ' + str(exc), file=sys.stderr)
         return 1
     return 0
 
@@ -849,8 +849,8 @@ cleanup() {
   trap - EXIT INT TERM
   [[ -z $SMOKE_PID ]] || { kill "$SMOKE_PID" 2>/dev/null || true; wait "$SMOKE_PID" 2>/dev/null || true; }
   if (( MUTATED && ! SUCCESS )); then
-    echo 'Setup failed; restoring owned configuration and previous service states.' >&2
-    helper rollback 2>/dev/null || echo 'Panel rollback needs inspection; retain private backup.' >&2
+    echo 'Настройка завершилась ошибкой; восстанавливаются управляемые конфигурации и прежние состояния сервисов.' >&2
+    helper rollback 2>/dev/null || echo 'Откат панели требует проверки; сохраните закрытую резервную копию.' >&2
     [[ $(state_get is_existing) == true ]] || systemctl stop x-ui 2>/dev/null || true
     for path in "${FILES[@]}"; do
       rm -f -- "$path"
@@ -870,7 +870,7 @@ cleanup() {
       if [[ ${WAS_ENABLED[$svc]:-no} == yes ]]; then systemctl enable "$svc" 2>/dev/null || true; else systemctl disable "$svc" 2>/dev/null || true; fi
       if [[ ${WAS_ACTIVE[$svc]:-no} == yes ]]; then systemctl restart "$svc" 2>/dev/null || true; else systemctl stop "$svc" 2>/dev/null || true; fi
     done
-    echo "Private backup: $BACKUP. Installed packages and issued certificates are retained." >&2
+    echo "Закрытая резервная копия: $BACKUP. Установленные пакеты и выпущенные сертификаты сохраняются." >&2
   fi
   rm -rf -- "$WORK"
   exit "$rc"
@@ -878,17 +878,17 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if [[ -z $DOMAIN ]]; then read -r -p 'Domain (fully qualified, no scheme): ' DOMAIN; fi
+if [[ -z $DOMAIN ]]; then read -r -p 'Домен (полное имя, без http:// или https://): ' DOMAIN; fi
 DOMAIN=${DOMAIN,,}
 python3 - "$DOMAIN" <<'PY'
 import re,sys
 s=sys.argv[1]
 if len(s)>253 or '.' not in s or not all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', x) for x in s.split('.')):
-    sys.exit('Invalid DNS hostname. Use its ASCII/punycode form.')
+    sys.exit('Некорректное имя домена. Используйте форму ASCII/punycode.')
 PY
 EMAIL=''
-if (( ! CHECK )); then read -r -p 'Let’s Encrypt email (optional): ' EMAIL; fi
-[[ -z $EMAIL || $EMAIL =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || fail 'Invalid email.'
+if (( ! CHECK )); then read -r -p 'Email для Let’s Encrypt (необязательно): ' EMAIL; fi
+[[ -z $EMAIL || $EMAIL =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || fail 'Некорректный email.'
 DETECTED_SSH=$(python3 - <<'PY'
 import re,subprocess
 ports=set()
@@ -903,36 +903,36 @@ print(' '.join(map(str,sorted(ports))))
 PY
 )
 SSH_PORTS=''
-if (( ! CHECK )); then read -r -p "SSH TCP ports [${DETECTED_SSH:-22}] (space separated): " SSH_PORTS; fi
+if (( ! CHECK )); then read -r -p "TCP-порты SSH [${DETECTED_SSH:-22}] (через пробел): " SSH_PORTS; fi
 SSH_PORTS=${SSH_PORTS:-${DETECTED_SSH:-22}}
 PANEL_URL=''; PANEL_USER=''; PANEL_PASS=''; PANEL_2FA=''
 if (( ! CHECK )) && [[ -e /etc/x-ui/x-ui.db ]]; then
-  read -r -p 'Existing panel local URL/basePath (Enter to discover): ' PANEL_URL
-  read -r -p 'Existing administrator login: ' PANEL_USER
-  read -r -s -p 'Existing administrator password: ' PANEL_PASS; echo
-  read -r -s -p 'Administrator two-factor code (optional): ' PANEL_2FA; echo
+  read -r -p 'Локальный URL/basePath существующей панели (Enter для автоопределения): ' PANEL_URL
+  read -r -p 'Логин существующего администратора: ' PANEL_USER
+  read -r -s -p 'Пароль существующего администратора: ' PANEL_PASS; echo
+  read -r -s -p 'Код двухфакторной аутентификации администратора (необязательно): ' PANEL_2FA; echo
 fi
 PUBLIC_PANEL=n
 if (( ! CHECK )); then
-  read -r -p "Publish password-authenticated panel over HTTPS on $DOMAIN at its secret basePath? [Y/n]: " PUBLIC_PANEL
+  read -r -p "Опубликовать панель с входом по паролю через HTTPS на $DOMAIN по секретному basePath? [Y/n, Enter — да]: " PUBLIC_PANEL
   PUBLIC_PANEL=${PUBLIC_PANEL:-y}
-  [[ ${PUBLIC_PANEL,,} == y || ${PUBLIC_PANEL,,} == n ]] || fail 'Answer y or n.'
+  [[ ${PUBLIC_PANEL,,} == y || ${PUBLIC_PANEL,,} == n ]] || fail 'Введите y (да) или n (нет).'
   if [[ ${PUBLIC_PANEL,,} == y && $PANEL_USER == admin && $PANEL_PASS == admin ]]; then
-    fail 'Change default administrator credentials privately before publishing the existing panel.'
+    fail 'Перед публикацией существующей панели смените стандартные учетные данные администратора через закрытое соединение.'
   fi
 fi
 SECURITY=n
 if (( ! CHECK )); then
-  read -r -p 'Manage firewall with UFW (deny incoming, allow outgoing) and enable SSH fail2ban? [Y/n]: ' SECURITY
+  read -r -p 'Настроить UFW (запрет входящих, разрешение исходящих) и включить fail2ban для SSH? [Y/n, Enter — да]: ' SECURITY
   SECURITY=${SECURITY:-y}
-  [[ ${SECURITY,,} == y || ${SECURITY,,} == n ]] || fail 'Answer y or n.'
-  if [[ ${SECURITY,,} == n ]]; then echo 'WARNING: firewall/fail2ban setup skipped. External port restriction is NOT verified or enforced.' >&2; fi
+  [[ ${SECURITY,,} == y || ${SECURITY,,} == n ]] || fail 'Введите y (да) или n (нет).'
+  if [[ ${SECURITY,,} == n ]]; then echo 'ВНИМАНИЕ: настройка межсетевого экрана и fail2ban пропущена. Ограничение внешних портов не проверяется и не применяется.' >&2; fi
 fi
 export DOMAIN EMAIL SSH_PORTS PANEL_URL PANEL_USER PANEL_PASS PANEL_2FA SECURITY PUBLIC_PANEL
 python3 - "$STATE" <<'PY'
 import json,os,sys
 ports=[int(p) for p in os.environ['SSH_PORTS'].split()]
-if not ports or any(p<1 or p>65535 for p in ports): sys.exit('Invalid SSH ports')
+if not ports or any(p<1 or p>65535 for p in ports): sys.exit('Некорректные порты SSH')
 s=dict(domain=os.environ['DOMAIN'],email=os.environ['EMAIL'],ssh_ports=sorted(set(ports)),panel_binary='/usr/local/x-ui/x-ui',panel_db='/etc/x-ui/x-ui.db',panel_url=os.environ['PANEL_URL'],panel_username=os.environ['PANEL_USER'],panel_password=os.environ['PANEL_PASS'],target_port=9443,allow_firewall=os.environ['SECURITY'].lower()=='y')
 s['publish_panel']=os.environ['PUBLIC_PANEL'].lower()=='y'
 s['panel_snippet']='/etc/nginx/snippets/selfsteal-3xui-panel-'+s['domain']+'.conf'
@@ -951,7 +951,7 @@ python3 - "$DOMAIN" <<'PY' || DNS_RC=$?
 import ipaddress,json,socket,subprocess,sys,urllib.request
 host=sys.argv[1]
 try: dns={x[4][0] for x in socket.getaddrinfo(host,443,type=socket.SOCK_STREAM)}
-except socket.gaierror as e: sys.exit(f'DNS lookup failed: {e}')
+except socket.gaierror as e: sys.exit(f'Ошибка DNS-запроса: {e}')
 local=set()
 p=subprocess.run(['ip','-j','address'],capture_output=True,text=True,check=True)
 for interface in json.loads(p.stdout):
@@ -963,16 +963,16 @@ for url in ('https://api.ipify.org','https://api6.ipify.org'):
   local.add(str(ipaddress.ip_address(value)))
  except Exception: pass
 print('DNS A/AAAA:', ', '.join(sorted(dns)))
-print('Detected public addresses:', ', '.join(sorted(local)) or '(unavailable)')
+print('Обнаруженные публичные адреса:', ', '.join(sorted(local)) or '(недоступны)')
 if not dns or not dns.issubset(local):
- print('Mismatch: fix every A/AAAA record (including stale IPv6). If behind NAT, explicit override requires checking port forwarding for TCP80/443.',file=sys.stderr)
+ print('Несовпадение: исправьте все записи A/AAAA, включая устаревшие IPv6. При работе за NAT для продолжения нужно проверить проброс TCP-портов 80/443.',file=sys.stderr)
  sys.exit(42)
 PY
 if (( DNS_RC )); then
-  (( DNS_RC == 42 )) || fail 'DNS/public-address preflight failed.'
-  (( ! CHECK )) || fail 'DNS mismatch: check is read-only and cannot approve a NAT override.'
-  read -r -p 'NAT override: type I VERIFIED DNS AND PORT FORWARDING to continue: ' ANSWER
-  [[ $ANSWER == 'I VERIFIED DNS AND PORT FORWARDING' ]] || fail 'DNS mismatch not approved.'
+  (( DNS_RC == 42 )) || fail 'Предварительная проверка DNS и публичного адреса не пройдена.'
+  (( ! CHECK )) || fail 'Несовпадение DNS: режим проверки не вносит изменений и не позволяет подтвердить работу за NAT.'
+  read -r -p 'Продолжение за NAT: введите I VERIFIED DNS AND PORT FORWARDING после проверки DNS и проброса портов: ' ANSWER
+  [[ $ANSWER == 'I VERIFIED DNS AND PORT FORWARDING' ]] || fail 'Продолжение при несовпадении DNS не подтверждено.'
 fi
 SITE=/etc/nginx/sites-available/selfsteal-3xui-$DOMAIN
 LINK=/etc/nginx/sites-enabled/selfsteal-3xui-$DOMAIN
@@ -994,7 +994,7 @@ PY
 fi
 # Discover the actual config file rather than guessing or replacing a custom site.
 if command -v nginx >/dev/null; then
-  nginx -T > "$WORK/nginx.txt" 2>&1 || fail 'Existing nginx configuration is invalid.'
+  nginx -T > "$WORK/nginx.txt" 2>&1 || fail 'Существующая конфигурация nginx некорректна.'
   EXISTING_SITE=$(python3 - "$WORK/nginx.txt" "$DOMAIN" "$STOCK_DEFAULT" <<'PY'
 import re,sys
 text=open(sys.argv[1]).read(); domain=sys.argv[2]; matches=[]; checked=[]
@@ -1003,16 +1003,16 @@ for path,body in re.findall(r'# configuration file ([^:\n]+):\n(.*?)(?=\n# confi
  checked.append(body)
  if any(domain in names.split() for names in re.findall(r'\bserver_name\s+([^;]+);',body)):
   if not re.search(r'listen\s+127\.0\.0\.1:9443\s+ssl[^;]*proxy_protocol',body) or not re.search(r'ssl_protocols\s+TLSv1\.3\s*;',body) or 'ssl_reject_handshake on;' not in body or '/.well-known/acme-challenge/' not in body:
-   sys.exit(f'Custom nginx site conflicts: {path}. Configure self-steal TLS1.3/PROXY listener and ACME explicitly; no file was replaced.')
+   sys.exit(f'Конфликт пользовательского сайта nginx: {path}. Настройте адрес self-steal с TLS 1.3/PROXY protocol и ACME вручную; файлы не заменены.')
   if f'/etc/letsencrypt/live/{domain}/fullchain.pem' not in body:
-   sys.exit(f'Existing certificate configuration conflicts: {path}')
+   sys.exit(f'Конфликт существующей конфигурации сертификата: {path}')
   matches.append(path)
-if len(set(matches))>1: sys.exit('Multiple nginx files configure this domain; resolve conflict first.')
+if len(set(matches))>1: sys.exit('Домен настроен в нескольких файлах nginx; сначала устраните конфликт.')
 if matches: print(matches[0])
 elif any(re.search(r'listen\s+(?:\[::\]:)?80[^;]*default_server',body) and not re.search(r'return\s+444\s*;',body) for body in checked):
- sys.exit('Existing default HTTP site does not reject unknown hosts. Preserve it or configure return444 manually before rerunning.')
+ sys.exit('Существующий HTTP-сайт по умолчанию не отклоняет неизвестные домены. Сохраните его или настройте return 444 вручную перед повторным запуском.')
 PY
-) || fail 'Nginx site conflict. Existing files were not changed.'
+) || fail 'Конфликт сайта nginx. Существующие файлы не изменены.'
 fi
 python3 - "$STATE" "$EXISTING_SITE" <<'PY'
 import json,sys
@@ -1023,25 +1023,25 @@ python3 - "$EXISTING_SITE" <<'PY'
 import subprocess,sys
 for line in subprocess.check_output(['ss','-ltnpH'],text=True).splitlines():
  address=line.split()[3]; port=int(address.rsplit(':',1)[1])
- if port==80 and 'nginx' not in line: sys.exit('TCP80 is occupied by a non-nginx service.')
+ if port==80 and 'nginx' not in line: sys.exit('TCP 80 занят сервисом, отличным от nginx.')
  if port==9443 and not (sys.argv[1] and 'nginx' in line and address.startswith('127.0.0.1:')):
-  sys.exit('Target TCP9443 is occupied by an incompatible listener.')
+  sys.exit('Целевой TCP-порт 9443 занят несовместимым сервисом.')
 PY
 if [[ $(state_get allow_firewall) == true ]]; then
   # Do not fight another firewall manager or silently retain public panel rules.
-  systemctl is-active --quiet firewalld && fail 'firewalld is active; use existing firewall management instead of UFW.' || true
+  systemctl is-active --quiet firewalld && fail 'Активен firewalld; используйте существующее управление межсетевым экраном вместо UFW.' || true
   if command -v ufw >/dev/null; then
     python3 - <<'PY'
 import pathlib,re,sys
 p=pathlib.Path('/etc/default/ufw')
-if not p.is_file(): sys.exit('UFW IPv6 policy file missing; inspect installation before opting into firewall management.')
+if not p.is_file(): sys.exit('Отсутствует файл политики IPv6 UFW; проверьте установку перед настройкой межсетевого экрана.')
 s=p.read_text(); values=re.findall(r'^\s*IPV6\s*=\s*["\']?(yes|no)["\']?\s*(?:#.*)?$',s,re.M)
-if len(values)!=1: sys.exit('UFW IPV6 setting is ambiguous; configure exactly one IPV6=yes/no assignment first.')
+if len(values)!=1: sys.exit('Параметр IPV6 UFW неоднозначен; оставьте ровно одну настройку IPV6=yes/no.')
 if values[0]=='no':
  rules=pathlib.Path('/etc/ufw/user6.rules')
  if rules.exists() and re.search(r'^-A ufw6-user-(?:input|forward)\b',rules.read_text(),re.M):
-  sys.exit('UFW IPv6 is disabled with dormant custom IPv6 input/forward rules. Review/remove those rules before rerunning; switching IPv6 on could expose extra ports.')
- print('UFW IPv6 enforcement will be enabled; no dormant custom IPv6 inbound rules found.')
+  sys.exit('IPv6 в UFW отключен, но сохранены пользовательские правила IPv6 input/forward. Проверьте или удалите их перед повторным запуском: включение IPv6 может открыть лишние порты.')
+ print('Будет включена фильтрация IPv6 в UFW; неактивных пользовательских входящих правил IPv6 не найдено.')
 PY
     ufw status numbered > "$WORK/ufw.txt"
     python3 - "$WORK/ufw.txt" "$SSH_PORTS" <<'PY'
@@ -1051,22 +1051,22 @@ for line in open(sys.argv[1]):
  if 'ALLOW' not in line and 'LIMIT' not in line: continue
  match=re.search(r'\]\s+(\d+)/tcp(?:\s|$)',line)
  if not match or int(match[1]) not in allowed:
-  sys.exit('Existing UFW allow/limit rule is outside SSH/80/443. Review it manually; this script never resets firewall rules.')
+  sys.exit('Существующее правило UFW allow/limit выходит за пределы SSH/80/443. Проверьте его вручную; скрипт не сбрасывает правила межсетевого экрана.')
 PY
   fi
 fi
-if (( CHECK )); then echo 'Read-only preflight passed. No packages, releases, services or production files changed.'; exit 0; fi
-printf '\nPlan: %s; self-steal443 ->127.0.0.1:9443; SSH ports:%s.\n' "$DOMAIN" "$SSH_PORTS"
-echo 'Preserve existing identities/admin and loopback panel listener. Install dependencies, obtain real certificate, configure nginx and3x-ui.'
+if (( CHECK )); then echo 'Проверка без изменений пройдена. Пакеты, версии программ, сервисы и рабочие файлы не изменены.'; exit 0; fi
+printf '\nПлан: %s; self-steal 443 -> 127.0.0.1:9443; порты SSH: %s.\n' "$DOMAIN" "$SSH_PORTS"
+echo 'Сохранить существующие идентификаторы, администратора и локальный адрес панели. Установить зависимости, получить сертификат, настроить nginx и 3x-ui.'
 if [[ $(state_get publish_panel) == true ]]; then
-  echo "Publish password-authenticated panel only at its secret HTTPS basePath on $DOMAIN; no public2053 or domain-root admin route."
+  echo "Опубликовать панель с входом по паролю только по секретному HTTPS basePath на $DOMAIN; без публичного порта 2053 и панели в корне домена."
 else
-  echo 'Do not add a public panel route; remove only intact script-owned panel snippet/include. Custom routes remain.'
+  echo 'Не добавлять публичный маршрут панели; удалить только неизмененные фрагменты и include панели, созданные скриптом. Пользовательские маршруты сохраняются.'
 fi
-echo 'On failure owned files/service states are restored; packages/certificates remain.'
-if (( STOCK_DEFAULT )); then echo 'Pristine distribution nginx default site will be disabled (backed up); custom sites remain untouched.'; fi
-read -r -p 'Type APPLY to confirm all mutations: ' ANSWER
-[[ $ANSWER == APPLY ]] || fail 'Cancelled without mutation.'
+echo 'При ошибке управляемые файлы и состояния сервисов восстанавливаются; пакеты и сертификаты сохраняются.'
+if (( STOCK_DEFAULT )); then echo 'Неизмененный стандартный сайт nginx будет отключен с резервным копированием; пользовательские сайты сохраняются.'; fi
+read -r -p 'Для подтверждения всех изменений введите APPLY: ' ANSWER
+[[ $ANSWER == APPLY ]] || fail 'Отменено без изменений.'
 if [[ $(state_get is_existing) == true ]]; then helper authenticate; fi
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)-$$
 BACKUP=/root/selfsteal-3xui/backups/$STAMP
@@ -1108,34 +1108,34 @@ if (( STOCK_DEFAULT || ! NGINX_WAS_INSTALLED )) && [[ -L /etc/nginx/sites-enable
   rm /etc/nginx/sites-enabled/default
 fi
 if [[ $(state_get is_existing) != true ]]; then
-  case $(uname -m) in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) fail 'Fresh install supports amd64/arm64 only.';; esac
-  echo "Fetching pinned 3x-ui $XUI_VERSION release metadata from GitHub..."
+  case $(uname -m) in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) fail 'Для новой установки поддерживаются только amd64/arm64.';; esac
+  echo "Получение данных закрепленной версии 3x-ui $XUI_VERSION с GitHub..."
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
     "https://api.github.com/repos/MHSanaei/3x-ui/releases/tags/v$XUI_VERSION" -o "$WORK/release.json"
   python3 - "$WORK/release.json" "$ARCH" "$WORK/release-meta" <<'PY'
 import json,re,sys
 r=json.load(open(sys.argv[1])); name=f'x-ui-linux-{sys.argv[2]}.tar.gz'
-if r.get('tag_name')!='v3.8.5' or r.get('draft') or r.get('prerelease'): sys.exit('Invalid pinned release')
+if r.get('tag_name')!='v3.8.5' or r.get('draft') or r.get('prerelease'): sys.exit('Некорректный закрепленный выпуск')
 a=next((a for a in r['assets'] if a['name']==name),None)
-if not a or not re.fullmatch(r'sha256:[0-9a-f]{64}',a.get('digest','')): sys.exit('Official API SHA256 digest unavailable; refusing execution')
+if not a or not re.fullmatch(r'sha256:[0-9a-f]{64}',a.get('digest','')): sys.exit('Официальный API не вернул SHA256; выполнение отменено')
 url=a['browser_download_url']
-if url!=f'https://github.com/MHSanaei/3x-ui/releases/download/v3.8.5/{name}': sys.exit('Unexpected asset origin')
+if url!=f'https://github.com/MHSanaei/3x-ui/releases/download/v3.8.5/{name}': sys.exit('Неожиданный источник файла выпуска')
 open(sys.argv[3],'w').write(url+'\n'+a['digest'][7:]+'\n')
 PY
   mapfile -t META < "$WORK/release-meta"
-  printf 'Downloading verified 3x-ui archive from: <%s>\n' "${META[0]}"
+  printf 'Загрузка проверенного архива 3x-ui: <%s>\n' "${META[0]}"
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "${META[0]}" -o "$WORK/release.tar.gz"
-  printf '%s  %s\n' "${META[1]}" "$WORK/release.tar.gz" | sha256sum --check --status || fail 'Release SHA256 mismatch.'
+  printf '%s  %s\n' "${META[1]}" "$WORK/release.tar.gz" | sha256sum --check --status || fail 'Контрольная сумма SHA256 выпуска не совпадает.'
   # Validate all paths before extraction, including symlinks/hardlinks.
   python3 - "$WORK/release.tar.gz" <<'PY'
 import pathlib,sys,tarfile
 with tarfile.open(sys.argv[1]) as t:
  for m in t.getmembers():
   p=pathlib.PurePosixPath(m.name)
-  if p.is_absolute() or '..' in p.parts or not p.parts or p.parts[0]!='x-ui' or m.issym() or m.islnk() or not (m.isfile() or m.isdir()): sys.exit('Unsafe release archive member')
+  if p.is_absolute() or '..' in p.parts or not p.parts or p.parts[0]!='x-ui' or m.issym() or m.islnk() or not (m.isfile() or m.isdir()): sys.exit('Небезопасный элемент архива выпуска')
 PY
-  [[ ! -e /usr/local/x-ui ]] || fail 'Existing /usr/local/x-ui without supported database: refusing overwrite.'
-  [[ ! -e /etc/x-ui ]] || fail 'Fresh install has an existing /etc/x-ui directory; inspect manually before continuing.'
+  [[ ! -e /usr/local/x-ui ]] || fail 'Каталог /usr/local/x-ui существует без поддерживаемой базы данных; перезапись отменена.'
+  [[ ! -e /etc/x-ui ]] || fail 'При новой установке обнаружен существующий каталог /etc/x-ui; проверьте его вручную перед продолжением.'
   FRESH_FILES=1
   tar -xzf "$WORK/release.tar.gz" -C /usr/local
   chmod 700 /usr/local/x-ui
@@ -1143,7 +1143,7 @@ PY
   install -m 755 /usr/local/x-ui/x-ui.sh /usr/bin/x-ui
   SERVICE_SOURCE=/usr/local/x-ui/x-ui.service
   [[ -f $SERVICE_SOURCE ]] || SERVICE_SOURCE=/usr/local/x-ui/x-ui.service.debian
-  [[ -f $SERVICE_SOURCE ]] || fail 'Verified archive contains no supported Debian service.'
+  [[ -f $SERVICE_SOURCE ]] || fail 'В проверенном архиве нет поддерживаемого сервиса Debian.'
   install -m 644 "$SERVICE_SOURCE" /etc/systemd/system/x-ui.service
   mkdir -p /etc/systemd/system/x-ui.service.d
   printf '[Service]\nUMask=0077\n' > /etc/systemd/system/x-ui.service.d/selfsteal-permissions.conf
@@ -1157,7 +1157,7 @@ if [[ -n $EXISTING_SITE ]]; then
 import re,sys
 s=open(sys.argv[1]).read()
 m=re.search(r'location\s+(?:\^~\s+)?/\.well-known/acme-challenge/\s*\{[^}]*\broot\s+([^;]+);',s,re.S)
-if not m: sys.exit('Cannot discover existing ACME webroot safely')
+if not m: sys.exit('Не удалось безопасно определить существующий корневой каталог ACME')
 print(m[1].strip())
 PY
 )
@@ -1181,14 +1181,14 @@ NGINX_DEFAULT
   fi
 fi
 if [[ -z $EXISTING_SITE ]]; then
-  [[ ! -e $ROOT ]] || fail "Existing webroot $ROOT conflicts; no assets will be overwritten."
+  [[ ! -e $ROOT ]] || fail "Конфликт с существующим корневым каталогом сайта $ROOT; файлы сайта не будут перезаписаны."
   FRESH_ROOT=1
   mkdir -p "$ROOT/.well-known/acme-challenge"
   chmod 755 "$ROOT" "$ROOT/.well-known" "$ROOT/.well-known/acme-challenge"
-  printf '<!doctype html><title>Welcome</title><h1>Welcome</h1>\n' > "$ROOT/index.html"
+  printf '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Добро пожаловать</title><h1>Добро пожаловать</h1></html>\n' > "$ROOT/index.html"
   chmod 644 "$ROOT/index.html"
 else
-  [[ -d $ROOT/.well-known/acme-challenge ]] || fail 'Existing ACME webroot is absent; create it manually without changing site/asset permissions.'
+  [[ -d $ROOT/.well-known/acme-challenge ]] || fail 'Существующий корневой каталог ACME отсутствует; создайте его вручную без изменения прав сайта и его файлов.'
 fi
 nginx -t
 systemctl enable nginx
@@ -1200,7 +1200,7 @@ import pathlib,re,sys
 p=pathlib.Path('/etc/default/ufw'); s=p.read_text()
 pattern=r'^(\s*IPV6\s*=\s*)["\']?(?:yes|no)["\']?(\s*(?:#.*)?)$'
 updated,n=re.subn(pattern,lambda m:m[1]+'yes'+m[2],s,flags=re.M)
-if n!=1: sys.exit('Cannot safely enable UFW IPv6: ambiguous/missing IPV6 setting.')
+if n!=1: sys.exit('Нельзя безопасно включить IPv6 в UFW: параметр IPV6 отсутствует или неоднозначен.')
 if updated!=s: p.write_text(updated)
 PY
   ufw default deny incoming
@@ -1209,7 +1209,7 @@ PY
   ufw allow 80/tcp; ufw allow 443/tcp
   ufw --force enable
 fi
-echo "Requesting Let's Encrypt certificate with HTTP-01 for $DOMAIN..."
+echo "Получение сертификата Let's Encrypt через HTTP-01 для $DOMAIN..."
 CERT_ARGS=(certonly --non-interactive --agree-tos --webroot -w "$ROOT" -d "$DOMAIN" --keep-until-expiring)
 if [[ -n $EMAIL ]]; then CERT_ARGS+=(--email "$EMAIL"); else CERT_ARGS+=(--register-unsafely-without-email); fi
 certbot "${CERT_ARGS[@]}"
@@ -1256,7 +1256,7 @@ JAIL
   systemctl enable --now fail2ban
   systemctl restart fail2ban
 fi
-echo 'Configuring and verifying the 3x-ui Reality inbound...'
+echo 'Настройка и проверка входящего подключения Reality в 3x-ui...'
 helper configure
 helper verify
 helper export
@@ -1265,8 +1265,8 @@ XRAY=''
 for binary in /usr/local/x-ui/bin/xray-linux-*; do
   if [[ -f $binary && -x $binary ]]; then XRAY=$binary; break; fi
 done
-[[ -n $XRAY && -x $XRAY ]] || fail 'Bundled Xray executable missing.'
-[[ -s $RESULT/client.json && -s $RESULT/client.txt ]] || fail 'Helper did not export actual client files.'
+[[ -n $XRAY && -x $XRAY ]] || fail 'Не найден встроенный исполняемый файл Xray.'
+[[ -s $RESULT/client.json && -s $RESULT/client.txt ]] || fail 'Помощник не экспортировал реальные файлы клиента.'
 python3 - "$RESULT/client.json" "$WORK/smoke.json" <<'PY'
 import json,socket,sys
 c=json.load(open(sys.argv[1]))
@@ -1277,27 +1277,27 @@ PY
 SMOKE_PORT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["inbounds"][0]["port"])' "$WORK/smoke.json")
 "$XRAY" run -c "$WORK/smoke.json" > "$WORK/smoke.log" 2>&1 &
 SMOKE_PID=$!
-echo 'Testing the exported VLESS client through the Reality proxy...'
+echo 'Проверка экспортированного клиента VLESS через прокси Reality...'
 for attempt in {1..30}; do
   if curl --fail --silent --show-error --max-time 10 --socks5-hostname "127.0.0.1:$SMOKE_PORT" https://api.ipify.org > "$RESULT/proxy-exit-ip.txt" 2>"$WORK/proxy-curl.err"; then break; fi
-  if (( attempt == 30 )); then echo 'Last curl diagnostic:' >&2; cat "$WORK/proxy-curl.err" >&2; fi
-  kill -0 "$SMOKE_PID" 2>/dev/null || fail 'Real client Xray stopped; inspect private smoke log.'
+  if (( attempt == 30 )); then echo 'Последняя диагностика curl:' >&2; cat "$WORK/proxy-curl.err" >&2; fi
+  kill -0 "$SMOKE_PID" 2>/dev/null || fail 'Клиент Xray остановился; проверьте закрытый журнал тестового подключения.'
   sleep 1
 done
-[[ -s $RESULT/proxy-exit-ip.txt ]] || fail 'Reality client HTTPS smoke failed; inspect the curl diagnostic above and the private Xray log.'
-echo 'Checking HTTPS through the Reality proxy...'
+[[ -s $RESULT/proxy-exit-ip.txt ]] || fail 'Проверка HTTPS через клиент Reality не пройдена; изучите диагностику curl выше и закрытый журнал Xray.'
+echo 'Проверка HTTPS через прокси Reality...'
 curl --fail --silent --show-error --max-time 30 --socks5-hostname "127.0.0.1:$SMOKE_PORT" https://example.com/ -o "$WORK/proxy-https.html"
 kill "$SMOKE_PID"; wait "$SMOKE_PID" || true; SMOKE_PID=''
-echo "Checking the public HTTPS fallback for $DOMAIN..."
+echo "Проверка публичного HTTPS-сайта маскировки для $DOMAIN..."
 curl --fail --silent --show-error --max-time 30 "https://$DOMAIN/" -o "$WORK/ordinary-https.html"
 if [[ $(state_get public_url) == https://* ]]; then
-  echo 'Checking the public panel HTTPS API route...'
+  echo 'Проверка публичного маршрута HTTPS API панели...'
   curl --fail --silent --show-error --max-time 30 "$(state_get public_url)csrf-token" -o "$WORK/public-panel-csrf.json"
   python3 - "$WORK/public-panel-csrf.json" <<'PY'
 import json,sys
 r=json.load(open(sys.argv[1]))
 if r.get('success') is not True or not isinstance(r.get('obj'),str) or not r['obj']:
-    sys.exit('Public panel route did not return a valid session CSRF token')
+    sys.exit('Публичный маршрут панели не вернул корректный CSRF-токен сессии')
 PY
 fi
 # Independent trusted TLS and strict wrong/no-SNI proof through the public endpoint.
@@ -1307,37 +1307,44 @@ host=sys.argv[1]
 ctx=ssl.create_default_context(); ctx.minimum_version=ssl.TLSVersion.TLSv1_3
 with socket.create_connection((host,443),timeout=15) as s:
  with ctx.wrap_socket(s,server_hostname=host) as t:
-  if t.version()!='TLSv1.3': sys.exit('Ordinary HTTPS did not negotiate TLS1.3')
-  print('Trusted TLS1.3 and hostname certificate: verified')
+  if t.version()!='TLSv1.3': sys.exit('Обычное HTTPS-соединение не согласовало TLS 1.3')
+  print('Доверенный TLS 1.3 и сертификат домена: проверены')
 for name in ('invalid.example',None):
  c=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); c.check_hostname=False; c.verify_mode=ssl.CERT_NONE
  try:
   with socket.create_connection((host,443),timeout=15) as s:
    with c.wrap_socket(s,server_hostname=name): pass
  except ssl.SSLError: continue
- except OSError as e: sys.exit(f'Wrong/no-SNI verification inconclusive: {e}')
- sys.exit(f'Unexpected accepted TLS handshake for SNI {name!r}')
-print('Wrong/no-SNI: rejected')
+ except OSError as e: sys.exit(f'Не удалось однозначно проверить неверный или отсутствующий SNI: {e}')
+ sys.exit(f'Неожиданно принято TLS-соединение с SNI {name!r}')
+print('Неверный или отсутствующий SNI: соединение отклонено')
 PY
 helper verify
-echo 'Testing certificate renewal in dry-run mode...'
+echo 'Проверка продления сертификата в тестовом режиме...'
 certbot renew --dry-run --run-deploy-hooks --cert-name "$DOMAIN"
 qrencode -t UTF8 -o "$RESULT/client-qr.txt" < "$RESULT/client.txt"
 cp "$STATE" "$BACKUP/final-state.json"; chmod 600 "$BACKUP/final-state.json"
 chmod 600 "$RESULT"/*
-echo "Setup verified. Private results: $RESULT; backup: $BACKUP"
-echo "Real proxy exit IP: $(cat "$RESULT/proxy-exit-ip.txt")"
-echo 'VLESS client URI (secret; do not post publicly):'
+echo "Настройка проверена. Закрытые результаты: $RESULT; резервная копия: $BACKUP"
+echo "Фактический выходной IP прокси: $(cat "$RESULT/proxy-exit-ip.txt")"
+echo 'Ссылка клиента VLESS (секретная; не публикуйте):'
 cat "$RESULT/client.txt"
 cat "$RESULT/client-qr.txt"
-echo "Panel access instructions/credentials: $RESULT/access.json (root-only)."
+echo "Инструкция и учетные данные панели: $RESULT/access.json (доступ только root)."
 python3 - "$RESULT/access.json" <<'PY'
 import json,sys
 a=json.load(open(sys.argv[1]))
-print('SSH tunnel:',a['ssh_tunnel'])
-print('Open locally:',a['browser_url'])
+print('SSH-туннель:',a['ssh_tunnel'])
+print('Откройте локально:',a['browser_url'])
 if a.get('public_url'):
-    print('Public HTTPS panel (secret path; password required):',a['public_url'])
-print('Public panel status:',a['public_panel_status'])
+    print('Публичная HTTPS-панель (секретный путь; требуется пароль):',a['public_url'])
+statuses = {
+    'disabled': 'публикация отключена',
+    'disabled-managed-route-removed': 'публикация отключена; маршрут скрипта удален',
+    'disabled-custom-routes-preserved': 'публикация скриптом отключена; пользовательские маршруты сохранены',
+    'existing-custom-route-preserved': 'существующий пользовательский маршрут сохранен',
+    'enabled-managed-route': 'публикация включена; маршрут создан скриптом',
+}
+print('Статус публичной панели:', statuses.get(a['public_panel_status'], a['public_panel_status']))
 PY
 SUCCESS=1
