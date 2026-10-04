@@ -1485,7 +1485,7 @@ if (( ! CHECK )); then
   [[ ${SECURITY,,} == y || ${SECURITY,,} == n ]] || fail 'Введите y (да) или n (нет).'
   if [[ ${SECURITY,,} == n ]]; then echo 'ВНИМАНИЕ: настройка межсетевого экрана и fail2ban пропущена. Ограничение внешних портов не проверяется и не применяется.' >&2; fi
 fi
-export DOMAIN SITE_NAME EMAIL SSH_PORTS PANEL_URL PANEL_USER PANEL_PASS PANEL_2FA SECURITY PUBLIC_PANEL
+export DOMAIN SITE_NAME EMAIL SSH_PORTS PANEL_URL PANEL_USER PANEL_PASS PANEL_2FA SECURITY PUBLIC_PANEL SERVICES_BEFORE_JSON CERT_WAS_PRESENT UFW_WAS_ACTIVE
 python3 - "$STATE" <<'PY'
 import json,os,sys
 ports=[int(p) for p in os.environ['SSH_PORTS'].split()]
@@ -1496,6 +1496,11 @@ s['publish_panel']=os.environ['PUBLIC_PANEL'].lower()=='y'
 s['panel_snippet']='/etc/nginx/snippets/selfsteal-3xui-panel-'+s['domain']+'.conf'
 s['panel_map']='/etc/nginx/conf.d/selfsteal-3xui-panel-'+s['domain']+'-map.conf'
 s['panel_two_factor_code']=os.environ['PANEL_2FA']
+s['services_before']=json.loads(os.environ['SERVICES_BEFORE_JSON'])
+s['ufw_was_active']=os.environ['UFW_WAS_ACTIVE'] == '1'
+s['cert_was_present']=os.environ['CERT_WAS_PRESENT'] == '1'
+s['packages_added_by_script']=[]
+s['removed']=False
 with open(sys.argv[1],'w') as f: json.dump(s,f)
 os.chmod(sys.argv[1],0o600)
 PY
@@ -1663,7 +1668,15 @@ if command -v nginx >/dev/null; then NGINX_WAS_INSTALLED=1; fi
 MUTATED=1
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y ca-certificates curl openssl nginx certbot qrencode iproute2 fail2ban ufw
+apt-get install -y "${INSTALL_PACKAGES[@]}"
+export INSTALL_PACKAGES="${INSTALL_PACKAGES[*]}" PREINSTALLED_PACKAGES="${PREINSTALLED_PACKAGES[*]}"
+python3 - "$STATE" <<'PY'
+import json,os,sys
+s=json.load(open(sys.argv[1]))
+pre=set(os.environ.get('PREINSTALLED_PACKAGES','').split())
+s['packages_added_by_script']=[p for p in os.environ.get('INSTALL_PACKAGES','').split() if p and p not in pre]
+with open(sys.argv[1],'w') as f: json.dump(s,f)
+PY
 if (( STOCK_DEFAULT || ! NGINX_WAS_INSTALLED )) && [[ -L /etc/nginx/sites-enabled/default && $(readlink -f /etc/nginx/sites-enabled/default) == /etc/nginx/sites-available/default ]]; then
   snapshot /etc/nginx/sites-enabled/default
   rm /etc/nginx/sites-enabled/default
