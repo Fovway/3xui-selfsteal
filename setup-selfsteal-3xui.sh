@@ -7,12 +7,16 @@ XUI_VERSION=3.8.5
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY
 CHECK=0
 DOMAIN=''
+ACTION='menu'
 while (( $# )); do
   case $1 in
     --help|-h) cat <<'HELP'
-Использование: sudo bash setup-selfsteal-3xui.sh [--check [--domain ДОМЕН]]
-Интерактивная настройка Ubuntu/Debian с systemd; переменные окружения задавать не нужно.
---check проверяет систему, DNS и конфликты без изменений и запроса учетных данных.
+Использование: sudo bash setup-selfsteal-3xui.sh [--install|--uninstall|--status|--check]
+Без аргументов открывается меню: установка, удаление компонентов этого скрипта или проверка текущего состояния.
+--install запускает установку/настройку.
+--uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
+--status показывает состояние по пунктам без изменений.
+--check выполняет предварительную проверку системы, DNS и конфликтов без изменений и запроса учетных данных.
 Недостающие утилиты предварительной проверки устанавливаются только после отдельного подтверждения.
 При последующих ошибках эти пакеты сохраняются; --check ничего не устанавливает.
 Администраторы и клиенты существующей 3x-ui сохраняются. Панель слушает только локальный адрес;
@@ -20,7 +24,11 @@ while (( $# )); do
 Закрытые результаты и резервные копии сохраняются в /root/selfsteal-3xui/.
 HELP
       exit 0 ;;
-    --check) CHECK=1; shift ;;
+    --check) CHECK=1; ACTION=preflight; shift ;;
+    --install) ACTION=install; shift ;;
+    --uninstall|--remove) ACTION=uninstall; shift ;;
+    --status) ACTION=status; shift ;;
+    --menu) ACTION=menu; shift ;;
     --domain) [[ $# -ge 2 ]] || { echo 'Не указан домен' >&2; exit 2; }; DOMAIN=$2; shift 2 ;;
     *) printf 'Неизвестный аргумент: %s\n' "$1" >&2; exit 2 ;;
   esac
