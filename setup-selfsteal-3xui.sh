@@ -1911,6 +1911,9 @@ echo 'Проверка продления сертификата в тестов
 certbot renew --dry-run --run-deploy-hooks --cert-name "$DOMAIN"
 qrencode -t UTF8 -o "$RESULT/client-qr.txt" < "$RESULT/client.txt"
 cp "$STATE" "$BACKUP/final-state.json"; chmod 600 "$BACKUP/final-state.json"
+mkdir -p /root/selfsteal-3xui
+cp "$STATE" /root/selfsteal-3xui/state.json
+chmod 600 /root/selfsteal-3xui/state.json
 chmod 600 "$RESULT"/*
 echo "Настройка проверена. Закрытые результаты: $RESULT; резервная копия: $BACKUP"
 if (( FRESH_ROOT )); then echo "Страница-заглушка: $ROOT/index.html; шаблон: $PLACEHOLDER_TEMPLATE"; fi
