@@ -1761,6 +1761,11 @@ if [[ -z $EXISTING_SITE ]]; then
   chmod 755 "$ROOT" "$ROOT/.well-known" "$ROOT/.well-known/acme-challenge"
   PLACEHOLDER_TEMPLATE=$(write_placeholder "$ROOT/index.html")
   chmod 644 "$ROOT/index.html"
+  python3 - "$STATE" <<'PY'
+import json,sys
+p=sys.argv[1]; s=json.load(open(p)); s['fresh_root']=True
+with open(p,'w') as f: json.dump(s,f)
+PY
 else
   [[ -d $ROOT/.well-known/acme-challenge ]] || fail 'Существующий корневой каталог ACME отсутствует; создайте его вручную без изменения прав сайта и его файлов.'
 fi
