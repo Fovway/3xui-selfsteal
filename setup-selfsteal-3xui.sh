@@ -27,12 +27,512 @@ HELP
 done
 [[ -z $DOMAIN || $CHECK == 1 ]] || { echo '--domain поддерживается только вместе с --check' >&2; exit 2; }
 fail() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
+
+show_menu() {
+  local choice
+  echo
+  echo '==============================================='
+  echo '        3xUI Self-Steal — главное меню'
+  echo '==============================================='
+  echo '1) Установить / настроить self-steal'
+  echo '2) Удалить всё, что установил этот скрипт'
+  echo '3) Проверить установку и текущую настройку'
+  echo '0) Выход'
+  echo
+  while :; do
+    read -r -p 'Выберите пункт [1-3, 0]: ' choice
+    case "$choice" in
+      1) ACTION=install; return ;;
+      2) ACTION=uninstall; return ;;
+      3) ACTION=status; return ;;
+      0) exit 0 ;;
+      *) echo 'Введите 1, 2, 3 или 0.' ;;
+    esac
+  done
+}
+
+load_install_state() {
+  local candidate
+  [[ -d /root/selfsteal-3xui ]] || return 1
+  if [[ -f /root/selfsteal-3xui/state.json ]]; then
+    printf '%s\n' /root/selfsteal-3xui/state.json
+    return 0
+  fi
+  candidate=$(find /root/selfsteal-3xui/backups -mindepth 2 -maxdepth 2 -type f -name final-state.json -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1{sub(/^[^ ]+ /,""); print}')
+  [[ -n "$candidate" ]] || return 1
+  printf '%s\n' "$candidate"
+}
+
+status_mark() {
+  case "$1" in
+    ok) printf '[OK]' ;;
+    warn) printf '[!!]' ;;
+    fail) printf '[FAIL]' ;;
+    skip) printf '[--]' ;;
+  esac
+}
+
+status_line() {
+  printf ' %s %-36s %s\n' "$(status_mark "$1")" "$2" "$3"
+}
+
+status_removed() {
+  local state_file=$1 domain site snippet map_conf link root
+  domain=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1])).get('domain',''))
+PY
+)
+  site=$(python3 - "$state_file" <<'PY'
+import json,sys
+s=json.load(open(sys.argv[1])); print(s.get('nginx_site') or ('/etc/nginx/sites-available/selfsteal-3xui-' + s.get('domain','')))
+PY
+)
+  snippet=$(python3 - "$state_file" <<'PY'
+import json,sys
+s=json.load(open(sys.argv[1])); print(s.get('panel_snippet') or ('/etc/nginx/snippets/selfsteal-3xui-panel-' + s.get('domain','') + '.conf'))
+PY
+)
+  map_conf=$(python3 - "$state_file" <<'PY'
+import json,sys
+s=json.load(open(sys.argv[1])); print(s.get('panel_map') or ('/etc/nginx/conf.d/selfsteal-3xui-panel-' + s.get('domain','') + '-map.conf'))
+PY
+)
+  link="/etc/nginx/sites-enabled/$(basename "$site")"
+  root="/var/www/selfsteal-3xui-$domain"
+  status_line ok 'Self-steal установка' 'удалена'
+  [[ -e /usr/local/x-ui || -e /etc/x-ui/x-ui.db ]] && status_line warn '3x-ui, установленная скриптом' 'остатки найдены' || status_line ok '3x-ui, установленная скриптом' 'не найдена'
+  [[ -e "$site" || -L "$link" || -e "$snippet" || -e "$map_conf" || -e /etc/nginx/conf.d/selfsteal-3xui-default.conf ]] && status_line warn 'nginx-компоненты скрипта' 'остатки найдены' || status_line ok 'nginx-компоненты скрипта' 'не найдены'
+  [[ -e "$root" ]] && status_line warn 'Страница-заглушка' "$root ещё существует" || status_line ok 'Страница-заглушка' 'удалена'
+  echo
+  echo 'Изменений не выполнено.'
+  exit 0
+}
+
+status_report() {
+  echo
+  echo '==============================================='
+  echo '       3xUI Self-Steal — проверка состояния'
+  echo '==============================================='
+
+  local state_file
+  state_file=$(load_install_state || true)
+  if [[ -z "$state_file" || ! -r "$state_file" ]]; then
+    status_line warn 'Установка self-steal' 'сохранённого состояния нет'
+    echo '  Скрипт не обнаружил свою установку.'
+    exit 0
+  fi
+  command -v python3 >/dev/null || fail 'Для диагностики требуется python3.'
+
+  local removed
+  removed=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(str(json.load(open(sys.argv[1])).get('removed',False)).lower())
+PY
+)
+  [[ "$removed" == true ]] && status_removed "$state_file"
+
+  local domain panel_port panel_path publish public_url result_dir allow_fw site snippet map_conf link certfile expiry reality_out installed_version
+  domain=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1])).get('domain',''))
+PY
+)
+  panel_port=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1])).get('panel_port','2053'))
+PY
+)
+  panel_path=$(python3 - "$state_file" <<'PY'
+import json,sys,urllib.parse
+u=urllib.parse.urlsplit(json.load(open(sys.argv[1])).get('panel_url',''))
+print(u.path or '/')
+PY
+)
+  publish=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(str(json.load(open(sys.argv[1])).get('publish_panel',False)).lower())
+PY
+)
+  public_url=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1])).get('public_url') or '')
+PY
+)
+  result_dir=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1])).get('result_dir') or '')
+PY
+)
+  allow_fw=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(str(json.load(open(sys.argv[1])).get('allow_firewall',False)).lower())
+PY
+)
+  site=$(python3 - "$state_file" <<'PY'
+import json,sys
+s=json.load(open(sys.argv[1])); print(s.get('nginx_site') or ('/etc/nginx/sites-available/selfsteal-3xui-' + s.get('domain','')))
+PY
+)
+  snippet=$(python3 - "$state_file" <<'PY'
+import json,sys
+s=json.load(open(sys.argv[1])); print(s.get('panel_snippet') or ('/etc/nginx/snippets/selfsteal-3xui-panel-' + s.get('domain','') + '.conf'))
+PY
+)
+  map_conf=$(python3 - "$state_file" <<'PY'
+import json,sys
+s=json.load(open(sys.argv[1])); print(s.get('panel_map') or ('/etc/nginx/conf.d/selfsteal-3xui-panel-' + s.get('domain','') + '-map.conf'))
+PY
+)
+  link="/etc/nginx/sites-enabled/$(basename "$site")"
+
+  status_line ok 'Сохранённое состояние' "$state_file"
+  status_line ok 'Домен' "$domain"
+
+  if [[ -x /usr/local/x-ui/x-ui ]]; then
+    installed_version=$(/usr/local/x-ui/x-ui -v 2>/dev/null | sed 's/^v//' || true)
+    if [[ "$installed_version" == '3.8.5' ]]; then
+      status_line ok '3x-ui версия' "$installed_version"
+    elif [[ -n "$installed_version" ]]; then
+      status_line warn '3x-ui версия' "$installed_version (проверена 3.8.5)"
+    else
+      status_line warn '3x-ui версия' 'не удалось определить'
+    fi
+    systemctl is-active --quiet x-ui && status_line ok '3x-ui сервис' 'запущен' || status_line fail '3x-ui сервис' 'не запущен'
+    systemctl is-enabled --quiet x-ui >/dev/null 2>&1 && status_line ok '3x-ui автозапуск' 'включён' || status_line warn '3x-ui автозапуск' 'выключен'
+    if ss -H -ltn 2>/dev/null | grep -Eq "127\\.0\\.0\\.1:$panel_port[[:space:]]"; then
+      status_line ok 'Панель слушает' "127.0.0.1:$panel_port"
+    else
+      status_line warn 'Панель слушает' "127.0.0.1:$panel_port не найден"
+    fi
+    [[ -f /etc/x-ui/x-ui.db ]] && status_line ok 'База 3x-ui' '/etc/x-ui/x-ui.db' || status_line fail 'База 3x-ui' 'файл базы не найден'
+    status_line ok 'Локальный basePath' "$panel_path"
+  else
+    status_line fail '3x-ui' 'исполняемый файл не найден'
+  fi
+
+  if [[ -f /etc/x-ui/x-ui.db ]]; then
+    reality_out=$(python3 <<'PY'
+import sqlite3,json
+try:
+    db=sqlite3.connect('file:/etc/x-ui/x-ui.db?mode=ro', uri=True)
+    rows=db.execute('SELECT id,protocol,port,stream_settings FROM inbounds WHERE port=443 AND (node_id IS NULL OR node_id=0)').fetchall()
+    if not rows:
+        print('WARN|Reality inbound|на локальном порту 443 не найден')
+    elif len(rows)>1:
+        print('WARN|Reality inbound|найдено несколько входящих на 443')
+    else:
+        rid,proto,port,stream=rows[0]
+        stream=json.loads(stream); reality=stream.get('realitySettings') or {}
+        good=(proto=='vless' and stream.get('security')=='reality' and stream.get('network') in ('tcp','raw'))
+        target=reality.get('target') or reality.get('dest')
+        sni=",".join(reality.get('serverNames') or []) or 'не задан'
+        if good:
+            print('OK|Reality inbound|id=%s, port=443, target=%s, SNI=%s' % (rid,target or 'не задан',sni))
+            if target and target != '127.0.0.1:9443':
+                print('WARN|Reality target|' + target)
+        else:
+            print('FAIL|Reality inbound|порт 443 найден, но это не VLESS + Reality/TCP')
+except Exception as e:
+    print('FAIL|Reality inbound|ошибка чтения базы: ' + str(e))
+PY
+)
+    while IFS='|' read -r level name detail; do
+      case "$level" in
+        OK) status_line ok "$name" "$detail" ;;
+        WARN) status_line warn "$name" "$detail" ;;
+        FAIL) status_line fail "$name" "$detail" ;;
+      esac
+    done <<< "$reality_out"
+  fi
+
+  if command -v nginx >/dev/null; then
+    systemctl is-active --quiet nginx && status_line ok 'nginx сервис' 'запущен' || status_line fail 'nginx сервис' 'не запущен'
+    nginx -t >/dev/null 2>&1 && status_line ok 'nginx конфигурация' 'корректна' || status_line fail 'nginx конфигурация' 'ошибка nginx -t'
+    [[ -f "$site" ]] && status_line ok 'nginx сайт' "$site" || status_line warn 'nginx сайт' 'управляемый сайт не найден'
+    [[ -L "$link" ]] && status_line ok 'nginx site-link' "$link" || status_line warn 'nginx site-link' 'ссылка не найдена'
+    [[ -f "$snippet" ]] && status_line ok 'Маршрут панели' "$snippet" || { [[ "$publish" == false ]] && status_line skip 'Маршрут панели' 'публикация выключена' || status_line fail 'Маршрут панели' 'include не найден'; }
+    [[ -f "$map_conf" ]] && status_line ok 'WebSocket map' "$map_conf" || status_line warn 'WebSocket map' 'файл не найден'
+  else
+    status_line fail 'nginx' 'не установлен'
+  fi
+
+  certfile="/etc/letsencrypt/live/$domain/fullchain.pem"
+  if [[ -s "$certfile" ]]; then
+    expiry=$(openssl x509 -enddate -noout -in "$certfile" 2>/dev/null | cut -d= -f2- || true)
+    if [[ -n "$expiry" ]]; then
+      status_line ok 'TLS сертификат' "до $expiry"
+    else
+      status_line warn 'TLS сертификат' 'найден, срок не удалось определить'
+    fi
+  else
+    status_line fail 'TLS сертификат' "не найден для $domain"
+  fi
+  systemctl is-active --quiet certbot.timer && status_line ok 'certbot timer' 'запущен' || status_line warn 'certbot timer' 'не запущен'
+
+  if [[ "$allow_fw" == true ]]; then
+    if command -v ufw >/dev/null && ufw status | grep -q 'Status: active'; then
+      status_line ok 'UFW' 'активен'
+      ufw status | grep -Eq '443/tcp.*ALLOW|80/tcp.*ALLOW' && status_line ok 'UFW веб-порты' '80/443 разрешены' || status_line warn 'UFW веб-порты' 'ожидаемые правила не найдены'
+    else
+      status_line fail 'UFW' 'не активен, хотя его включали при установке'
+    fi
+    systemctl is-active --quiet fail2ban && status_line ok 'fail2ban' 'запущен' || status_line warn 'fail2ban' 'не запущен'
+    [[ -f /etc/fail2ban/jail.d/selfsteal-3xui.conf ]] && status_line ok 'fail2ban SSH-jail' 'файл найден' || status_line warn 'fail2ban SSH-jail' 'файл не найден'
+  else
+    status_line skip 'UFW / fail2ban' 'не включались этим скриптом'
+  fi
+
+  if [[ "$publish" == true ]]; then
+    [[ -n "$public_url" ]] && status_line ok 'Публичная панель' "$public_url" || status_line warn 'Публичная панель' 'URL не сохранён'
+  else
+    status_line skip 'Публичная панель' 'отключена'
+  fi
+
+  if getent ahosts "$domain" >/dev/null 2>&1; then
+    status_line ok 'DNS' 'домен резолвится'
+  else
+    status_line fail 'DNS' "домен $domain не резолвится"
+  fi
+
+  if [[ -n "$result_dir" && -s "$result_dir/client.txt" ]]; then
+    status_line ok 'Конфигурация клиента' "$result_dir/client.txt"
+    if [[ -s "$result_dir/proxy-exit-ip.txt" ]]; then
+      status_line ok 'Тест Reality' "выходной IP: $(cat "$result_dir/proxy-exit-ip.txt")"
+    else
+      status_line warn 'Тест Reality' 'результат smoke-test не найден'
+    fi
+  else
+    status_line warn 'Результаты установки' 'client.txt не найден'
+  fi
+
+  echo
+  echo 'Итог:'
+  if curl -fsS --max-time 8 "https://$domain/" >/dev/null 2>&1; then
+    echo '  [OK] Обычный HTTPS-сайт отвечает.'
+  else
+    echo '  [!!] Обычный HTTPS-сайт не ответил на проверку.'
+  fi
+  echo '  Проверка ничего не изменяет и не перезапускает сервисы.'
+  echo
+  exit 0
+}
+
+uninstall_script() {
+  echo
+  echo '==============================================='
+  echo '        3xUI Self-Steal — удаление'
+  echo '==============================================='
+
+  local state_file
+  state_file=$(load_install_state || true)
+  [[ -n "$state_file" && -r "$state_file" ]] || fail 'Не найдено сохранённое состояние установки. Нужен state.json или final-state.json из резервной копии.'
+  command -v python3 >/dev/null || fail 'Для удаления требуется python3.'
+
+  local domain backup_dir is_existing cert_was_present fresh_root site snippet map_conf
+  domain=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1])).get('domain',''))
+PY
+)
+  backup_dir=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1])).get('backup_dir',''))
+PY
+)
+  is_existing=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(str(json.load(open(sys.argv[1])).get('is_existing',False)).lower())
+PY
+)
+  cert_was_present=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(str(json.load(open(sys.argv[1])).get('cert_was_present',True)).lower())
+PY
+)
+  fresh_root=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(str(json.load(open(sys.argv[1])).get('fresh_root',False)).lower())
+PY
+)
+  site=$(python3 - "$state_file" <<'PY'
+import json,sys
+s=json.load(open(sys.argv[1])); print(s.get('nginx_site') or ('/etc/nginx/sites-available/selfsteal-3xui-' + s.get('domain','')))
+PY
+)
+  snippet=$(python3 - "$state_file" <<'PY'
+import json,sys
+s=json.load(open(sys.argv[1])); print(s.get('panel_snippet') or ('/etc/nginx/snippets/selfsteal-3xui-panel-' + s.get('domain','') + '.conf'))
+PY
+)
+  map_conf=$(python3 - "$state_file" <<'PY'
+import json,sys
+s=json.load(open(sys.argv[1])); print(s.get('panel_map') or ('/etc/nginx/conf.d/selfsteal-3xui-panel-' + s.get('domain','') + '-map.conf'))
+PY
+)
+
+  echo
+  echo "Домен: $domain"
+  echo "Резервная копия: $backup_dir"
+  echo
+  if [[ "$is_existing" == true ]]; then
+    echo 'ВНИМАНИЕ: 3x-ui существовала до установки этого скрипта.'
+    echo 'Для удаления изменений self-steal база 3x-ui будет восстановлена'
+    echo 'из panel-before.db. Изменения в 3x-ui, сделанные после установки скрипта,'
+    echo 'могут быть потеряны.'
+  else
+    echo '3x-ui была установлена этим скриптом и будет удалена.'
+  fi
+  read -r -p 'Для подтверждения удаления введите REMOVE SELFSTEAL: ' ANSWER
+  [[ "$ANSWER" == 'REMOVE SELFSTEAL' ]] || fail 'Удаление отменено.'
+
+  if [[ "$is_existing" == true ]]; then
+    systemctl stop x-ui 2>/dev/null || true
+    if [[ -s "$backup_dir/panel-before.db" ]]; then
+      [[ -d /etc/x-ui ]] || mkdir -p /etc/x-ui
+      cp -a "$backup_dir/panel-before.db" /etc/x-ui/x-ui.db
+      chmod 600 /etc/x-ui/x-ui.db
+    fi
+  else
+    systemctl disable --now x-ui 2>/dev/null || true
+  fi
+
+  python3 - "$backup_dir" "$site" "$snippet" "$map_conf" "$domain" "$fresh_root" <<'PY'
+import os,pathlib,shutil,sys
+backup=pathlib.Path(sys.argv[1])
+site=pathlib.Path(sys.argv[2])
+snippet=pathlib.Path(sys.argv[3])
+map_conf=pathlib.Path(sys.argv[4])
+domain=sys.argv[5]
+fresh_root=sys.argv[6].lower()=='true'
+root=pathlib.Path('/var/www/selfsteal-3xui-'+domain) if domain else None
+managed=[
+    site,
+    pathlib.Path('/etc/nginx/sites-enabled/selfsteal-3xui-'+domain) if domain else None,
+    snippet,
+    map_conf,
+    pathlib.Path('/etc/nginx/conf.d/selfsteal-3xui-default.conf'),
+    pathlib.Path('/etc/letsencrypt/renewal-hooks/deploy/selfsteal-3xui-nginx'),
+    pathlib.Path('/etc/fail2ban/jail.d/selfsteal-3xui.conf'),
+    pathlib.Path('/etc/systemd/system/x-ui.service'),
+    pathlib.Path('/etc/systemd/system/x-ui.service.d/selfsteal-permissions.conf'),
+    pathlib.Path('/usr/bin/x-ui'),
+]
+def rm_item(p):
+    if not p: return
+    try:
+        if p.is_symlink() or p.is_file(): p.unlink()
+        elif p.is_dir(): shutil.rmtree(p)
+    except FileNotFoundError:
+        pass
+def copy_item(src,dst):
+    rm_item(dst)
+    dst.parent.mkdir(mode=0o755,parents=True,exist_ok=True)
+    if src.is_symlink():
+        dst.symlink_to(os.readlink(src))
+    elif src.is_dir():
+        shutil.copytree(src,dst,symlinks=True)
+    else:
+        shutil.copy2(src,dst,follow_symlinks=False)
+snap=backup/'files'
+if snap.is_dir():
+    for src in sorted(snap.rglob('*')):
+        if src.is_dir() and not src.is_symlink():
+            continue
+        copy_item(src,pathlib.Path('/')/src.relative_to(snap))
+for p in managed:
+    if p is None: continue
+    relative=pathlib.Path(str(p).lstrip('/'))
+    if not (snap/relative).exists() and not (snap/relative).is_symlink():
+        rm_item(p)
+if fresh_root and root:
+    rm_item(root)
+PY
+
+  if [[ "$is_existing" != true ]]; then
+    rm -rf /usr/local/x-ui /etc/x-ui /etc/systemd/system/x-ui.service.d
+    rm -f /usr/bin/x-ui /etc/systemd/system/x-ui.service
+  fi
+  systemctl daemon-reload
+
+  if [[ "$cert_was_present" == false && -n "$domain" && -x /usr/bin/certbot ]]; then
+    if certbot certificates 2>/dev/null | grep -Fq "Certificate Name: $domain"; then
+      certbot delete --cert-name "$domain" --non-interactive || true
+    fi
+  fi
+
+  local packages
+  packages=$(python3 - "$state_file" <<'PY'
+import json,sys
+for p in json.load(open(sys.argv[1])).get('packages_added_by_script',[]):
+    print(p)
+PY
+)
+  if [[ -n "$packages" ]]; then
+    echo 'Удаляются только пакеты, которых не было до установки скрипта:'
+    printf '  %s\n' $packages
+    apt-get remove -y $packages || true
+  fi
+
+  local ufw_was_active
+  ufw_was_active=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(str(json.load(open(sys.argv[1])).get('ufw_was_active',False)).lower())
+PY
+)
+  if command -v ufw >/dev/null; then
+    if [[ "$ufw_was_active" == true ]]; then
+      ufw reload >/dev/null 2>&1 || true
+    else
+      ufw disable >/dev/null 2>&1 || true
+    fi
+  fi
+
+  python3 - "$state_file" <<'PY'
+import json,subprocess,sys
+s=json.load(open(sys.argv[1]))
+for svc,meta in s.get('services_before',{}).items():
+    if meta.get('enabled'):
+        subprocess.run(['systemctl','enable',svc],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(['systemctl','disable',svc],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    if meta.get('active'):
+        subprocess.run(['systemctl','start',svc],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(['systemctl','stop',svc],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+PY
+
+  python3 - "$state_file" <<'PY'
+import json,time,sys
+p=sys.argv[1]
+s=json.load(open(p)); s['removed']=True; s['removed_at']=int(time.time())
+with open('/root/selfsteal-3xui/state.json','w') as f:
+    json.dump(s,f,indent=2); f.write('\n')
+PY
+  chmod 600 /root/selfsteal-3xui/state.json
+
+  echo
+  echo 'Удаление завершено.'
+  echo 'Предсуществующие конфигурации восстановлены.'
+  echo 'Резервные копии и результаты оставлены в /root/selfsteal-3xui/.'
+  exit 0
+}
+
 [[ $EUID == 0 ]] || fail 'Запустите скрипт через sudo bash.'
 [[ -r /etc/os-release ]] || fail 'Не найден файл с информацией об операционной системе.'
 . /etc/os-release
 [[ $ID == ubuntu || $ID == debian ]] || fail 'Поддерживаются только Ubuntu и Debian.'
 [[ -d /run/systemd/system ]] || fail 'Требуется система с работающим systemd.'
 command -v systemctl >/dev/null || fail 'Не найден systemctl; требуется система с работающим systemd.'
+
+if [[ "$ACTION" == menu ]]; then
+  show_menu
+fi
+case "$ACTION" in
+  uninstall) uninstall_script ;;
+  status) status_report ;;
+esac
+
 (( CHECK )) || [[ -t 0 ]] || fail 'Требуется интерактивный терминал.'
 PREFLIGHT_PACKAGES=()
 command -v python3 >/dev/null || PREFLIGHT_PACKAGES+=(python3)
