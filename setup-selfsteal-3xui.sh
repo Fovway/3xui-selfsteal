@@ -1194,6 +1194,11 @@ def configure(state, save):
         raise
 
 
+def host_group_has_address(group, domain, port=443):
+    hosts = group.get('hosts') or []
+    return hosts in ([domain], ['%s:%d' % (domain, port)])
+
+
 def add_inbound(state, port, save):
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise RuntimeError('Порт должен быть целым числом от 1 до 65535')
@@ -1242,6 +1247,27 @@ def add_inbound(state, port, save):
 
     tag = 'selfsteal-reality-%d' % port
     host_remark = 'selfsteal-%d-to-443' % port
+    live_ids = {int(item.get('id') or 0) for item in inbounds}
+    host_groups = api.call('panel/api/hosts/list') or []
+    stale_groups = []
+    for group in host_groups:
+        try:
+            ids = [int(value) for value in group.get('inboundIds') or []]
+            same_record = (group.get('remark') == host_remark
+                           and host_group_has_address(group, domain)
+                           and int(group.get('port') or 0) == 443)
+        except (TypeError, ValueError):
+            continue
+        if same_record and ids and not any(value in live_ids for value in ids):
+            group_id = str(group.get('groupId') or '')
+            if not group_id:
+                raise RuntimeError('Найдена старая запись panel/hosts без ID; удалите её в панели вручную')
+            stale_groups.append(group_id)
+    for old_group_id in stale_groups:
+        api.call('panel/api/hosts/bulk/del', {'ids': [old_group_id]})
+    if stale_groups:
+        print('Удалена старая незавершённая запись panel/hosts для порта %d.' % port)
+
     private = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('=')
     short_id = secrets.token_hex(8)
     target = '127.0.0.1:%d' % int(state.get('target_port', 9443))
@@ -1318,7 +1344,7 @@ def add_inbound(state, port, save):
         matches = [group for group in groups
                    if group.get('inboundIds') == [created_id]
                    and group.get('remark') == host_remark
-                   and group.get('hosts') == [domain]
+                   and host_group_has_address(group, domain)
                    and int(group.get('port') or 0) == 443]
         if len(matches) != 1 or not matches[0].get('groupId'):
             raise RuntimeError('Запись panel/hosts не удалось подтвердить через API')
@@ -1396,7 +1422,7 @@ def add_inbound(state, port, save):
                           if owned_id is not None
                           and group.get('inboundIds') == [owned_id]
                           and group.get('remark') == host_remark
-                          and group.get('hosts') == [domain]
+                          and host_group_has_address(group, domain)
                           and int(group.get('port') or 0) == 443]
             for group in candidates:
                 gid = str(group.get('groupId') or '')
