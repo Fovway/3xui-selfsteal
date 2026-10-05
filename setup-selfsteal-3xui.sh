@@ -573,6 +573,17 @@ UFW_WAS_ACTIVE=0
 if command -v ufw >/dev/null && ufw status | python3 -c 'import sys; sys.exit(0 if "Status: active" in sys.stdin.read() else 1)'; then UFW_WAS_ACTIVE=1; fi
 FILES=()
 SERVICES=(nginx x-ui fail2ban certbot.timer)
+# Snapshot service state before setup changes anything; uninstall restores these values.
+SERVICES_BEFORE_JSON=$(python3 - "${SERVICES[@]}" <<'PY'
+import json,subprocess,sys
+state={}
+for service in sys.argv[1:]:
+    active=subprocess.run(['systemctl','is-active','--quiet',service],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode == 0
+    enabled=subprocess.run(['systemctl','is-enabled','--quiet',service],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode == 0
+    state[service]={'active':active,'enabled':enabled}
+print(json.dumps(state,separators=(',',':')))
+PY
+)
 declare -A WAS_ACTIVE WAS_ENABLED
 emit_panel_helper() {
 cat <<'PANEL_PY'
@@ -1433,6 +1444,10 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 if [[ -z $DOMAIN ]]; then read -r -p 'Домен (полное имя, без http:// или https://): ' DOMAIN; fi
 DOMAIN=${DOMAIN,,}
+CERT_WAS_PRESENT=0
+if command -v certbot >/dev/null && certbot certificates 2>/dev/null | grep -Fq "Certificate Name: $DOMAIN"; then
+  CERT_WAS_PRESENT=1
+fi
 python3 - "$DOMAIN" <<'PY'
 import re,sys
 s=sys.argv[1]
