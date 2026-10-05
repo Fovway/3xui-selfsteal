@@ -11,10 +11,11 @@ ACTION='menu'
 while (( $# )); do
   case $1 in
     --help|-h) cat <<'HELP'
-Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--uninstall|--status|--check]
+Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check]
 Без аргументов открывается меню: установка, добавление inbound, удаление компонентов этого скрипта или проверка текущего состояния.
 --install запускает установку/настройку.
 --add-inbound добавляет VLESS + Reality inbound, привязывает его к выбранному существующему пользователю и создаёт запись panel/hosts для сохранённого домена:443.
+--repair-chain связывает уже созданные скриптом inbound в цепочку 443 -> дополнительные порты -> nginx и устанавливает fingerprint firefox.
 --uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
 --status показывает состояние по пунктам без изменений.
 --check выполняет предварительную проверку системы, DNS и конфликтов без изменений и запроса учетных данных.
@@ -28,6 +29,7 @@ HELP
     --check) CHECK=1; ACTION=preflight; shift ;;
     --install) ACTION=install; shift ;;
     --add-inbound) ACTION=add-inbound; shift ;;
+    --repair-chain) ACTION=repair-chain; shift ;;
     --uninstall|--remove) ACTION=uninstall; shift ;;
     --status) ACTION=status; shift ;;
     --menu) ACTION=menu; shift ;;
@@ -48,17 +50,19 @@ show_menu() {
   echo '2) Удалить всё, что установил этот скрипт'
   echo '3) Проверить установку и текущую настройку'
   echo '4) Добавить inbound и привязать к существующему пользователю'
+  echo '5) Исправить цепочку ранее созданных inbound'
   echo '0) Выход'
   echo
   while :; do
-    read -r -p 'Выберите пункт [1-4, 0]: ' choice
+    read -r -p 'Выберите пункт [1-5, 0]: ' choice
     case "$choice" in
       1) ACTION=install; return ;;
       2) ACTION=uninstall; return ;;
       3) ACTION=status; return ;;
       4) ACTION=add-inbound; return ;;
+      5) ACTION=repair-chain; return ;;
       0) exit 0 ;;
-      *) echo 'Введите 1, 2, 3, 4 или 0.' ;;
+      *) echo 'Введите 1, 2, 3, 4, 5 или 0.' ;;
     esac
   done
 }
@@ -224,8 +228,8 @@ PY
   fi
 
   if [[ -f /etc/x-ui/x-ui.db ]]; then
-    reality_out=$(python3 <<'PY'
-import sqlite3,json
+    reality_out=$(python3 - "$state_file" <<'PY'
+import sqlite3,json,sys
 try:
     db=sqlite3.connect('file:/etc/x-ui/x-ui.db?mode=ro', uri=True)
     rows=db.execute('SELECT id,protocol,port,stream_settings FROM inbounds WHERE port=443 AND (node_id IS NULL OR node_id=0)').fetchall()
@@ -241,7 +245,10 @@ try:
         sni=",".join(reality.get('serverNames') or []) or 'не задан'
         if good:
             print('OK|Reality inbound|id=%s, port=443, target=%s, SNI=%s' % (rid,target or 'не задан',sni))
-            if target and target != '127.0.0.1:9443':
+            state=json.load(open(sys.argv[1]))
+            added=state.get('added_inbounds') or []
+            expected_port=added[0]['port'] if state.get('reality_chain') and added else state.get('target_port',9443)
+            if target and target != '127.0.0.1:%d' % expected_port:
                 print('WARN|Reality target|' + target)
         else:
             print('FAIL|Reality inbound|порт 443 найден, но это не VLESS + Reality/TCP')
@@ -1167,7 +1174,8 @@ def configure(state, save):
             'subId': created_client['subId']}
         save()
     domain = state['domain']
-    reality.update(target='127.0.0.1:%d' % int(state.get('target_port', 9443)), serverNames=[domain], xver=1)
+    primary_target, primary_xver = chain_primary_endpoint(state)
+    reality.update(target=primary_target, serverNames=[domain], xver=primary_xver)
     reality.pop('dest', None)
     reality.setdefault('settings', {}).update(publicKey=public_key(reality['privateKey']), fingerprint='firefox', serverName=domain, spiderX='/')
     stream.update(network='tcp', security='reality', realitySettings=reality, tcpSettings={'header': {'type': 'none'}})
@@ -1249,6 +1257,178 @@ def check_client_binding(api, snapshot, inbound_ids):
     return current
 
 
+def chain_primary_endpoint(state):
+    added = state.get('added_inbounds') or []
+    chained = bool(state.get('reality_chain') and added)
+    port = added[0]['port'] if chained else state.get('target_port', 9443)
+    return '127.0.0.1:%d' % int(port), 0 if chained else 1
+
+
+def chain_plan(api, state, extra=None):
+    all_rows = api.list()
+    records = [{'id': state['inbound_id'], 'port': 443}] + list(state.get('added_inbounds') or [])
+    if extra:
+        records.append({'id': extra['id'], 'port': extra['port']})
+    ids = [int(record['id']) for record in records]
+    ports = [int(record['port']) for record in records]
+    nginx_port = int(state.get('target_port', 9443))
+    if (len(set(ids)) != len(ids) or len(set(ports)) != len(ports)
+            or nginx_port in ports or any(not 1 <= port <= 65535 for port in ports)):
+        raise RuntimeError('Конфликт ID или портов в сохранённой цепочке Reality')
+    plan = []
+    credentials = []
+    for index, record in enumerate(records):
+        matches = [row for row in all_rows if int(row.get('id') or 0) == int(record['id'])]
+        if len(matches) != 1:
+            raise RuntimeError('Сохранённый inbound ID %s не найден; цепочка не изменена' % record['id'])
+        before = matches[0]
+        stream = copy.deepcopy(parse(before['streamSettings']))
+        reality = stream.get('realitySettings') or {}
+        if (before.get('nodeId') or not before.get('enable', True)
+                or before.get('protocol') != 'vless' or int(before.get('port') or 0) != int(record['port'])
+                or (index and before.get('tag') != 'selfsteal-reality-%d' % int(record['port']))
+                or stream.get('security') != 'reality' or stream.get('network') not in ('tcp', 'raw')
+                or not reality.get('privateKey') or not reality.get('shortIds')
+                or reality.get('serverNames') != [state['domain']]):
+            raise RuntimeError('Inbound ID %s не соответствует сохранённой локальной настройке Reality' % record['id'])
+        if before.get('listen') not in ('', None, '0.0.0.0', '127.0.0.1', '::', '::0'):
+            raise RuntimeError('Inbound цепочки недоступен через loopback; проверьте поле listen')
+        if any(key == reality['privateKey'] and set(short_ids) & set(reality['shortIds'])
+               for key, short_ids in credentials):
+            raise RuntimeError('У двух inbound совпадают Reality-ключ и Short ID; цепочка не сможет различать их')
+        credentials.append((reality['privateKey'], reality['shortIds']))
+        port = ports[index + 1] if index + 1 < len(ports) else nginx_port
+        reality.update(target='127.0.0.1:%d' % port, xver=0 if index + 1 < len(ports) else 1)
+        reality.pop('dest', None)
+        reality.setdefault('settings', {}).update(publicKey=public_key(reality['privateKey']), fingerprint='firefox')
+        stream['realitySettings'] = reality
+        after = copy.deepcopy(before)
+        after['streamSettings'] = json.dumps(stream)
+        plan.append((before, after))
+    return plan
+
+
+def wait_chain_runtime(state, plan):
+    path = Path(state.get('runtime_config', str(Path(state['panel_binary']).parent / 'bin/config.json')))
+    for _ in range(30):
+        try:
+            runtime = json.loads(path.read_text())
+            for _, inbound in plan:
+                matches = [row for row in runtime.get('inbounds', [])
+                           if row.get('tag') == inbound['tag'] and row.get('port') == inbound['port']]
+                if len(matches) != 1 or matches[0].get('protocol') != 'vless':
+                    raise ValueError('missing runtime inbound')
+                row = matches[0]
+                expected = parse(inbound['streamSettings'])['realitySettings']
+                actual = row.get('streamSettings', {}).get('realitySettings', {})
+                if (actual.get('target', actual.get('dest')) != expected['target']
+                        or actual.get('xver', 0) != expected['xver']
+                        or any(actual.get(key) != expected.get(key) for key in ('privateKey', 'shortIds', 'serverNames'))):
+                    raise ValueError('runtime Reality differs')
+                stats = {stat['email']: stat.get('enable', True) for stat in inbound.get('clientStats', [])}
+                expected_clients = set()
+                for client in parse(inbound['settings']).get('clients', []):
+                    if not client_active(client, inbound) or not stats.get(client.get('email'), True):
+                        continue
+                    flow = client.get('flow', '')
+                    if flow == 'xtls-rprx-vision-udp443':
+                        flow = 'xtls-rprx-vision'
+                    expected_clients.add((client['id'], '' if inbound.get('disableFlow') else flow))
+                actual_clients = {(client['id'], client.get('flow', ''))
+                                  for client in row.get('settings', {}).get('clients', [])}
+                if actual_clients != expected_clients:
+                    raise ValueError('runtime clients differ')
+                with socket.create_connection(('127.0.0.1', inbound['port']), timeout=0.5):
+                    pass
+            return
+        except (OSError, ValueError, KeyError, TypeError):
+            time.sleep(1)
+    raise RuntimeError('Xray не подтвердил все переходы и пользователей цепочки Reality')
+
+
+def restore_chain(api, state, save):
+    journal = state.get('pending_chain')
+    if not journal:
+        return
+    errors = []
+    originals = [before for before in journal['before'] if before['id'] != journal.get('new_id')]
+    for before in reversed(originals):
+        try:
+            api.call('panel/api/inbounds/update/%s' % before['id'], payload(before))
+        except Exception:
+            errors.append(str(before['id']))
+    try:
+        api.restart()
+        current = {row['id']: row for row in api.list()}
+        for before in originals:
+            actual = current[before['id']]
+            if (parse(actual['streamSettings']) != parse(before['streamSettings'])
+                    or parse(actual['settings']) != parse(before['settings'])):
+                raise RuntimeError('Панель не подтвердила восстановление исходных параметров')
+        for snapshot in journal.get('clients', []):
+            check_client_binding(api, snapshot, snapshot.get('inboundIds') or [])
+        wait_chain_runtime(state, [(before, before) for before in originals])
+    except Exception:
+        errors.append('Xray restart')
+    if errors:
+        journal['rollback_incomplete'] = errors
+        save()
+        raise RuntimeError('Откат цепочки не завершён; сохранена закрытая копия исходных настроек')
+    state.pop('pending_chain', None)
+    save()
+
+
+def apply_chain(api, state, save, extra=None):
+    if state.get('pending_chain'):
+        raise RuntimeError('Есть незавершённое изменение цепочки; сначала проверьте сохранённые исходные настройки')
+    plan = chain_plan(api, state, extra)
+    clients = {}
+    for before, _ in plan:
+        for client in parse(before['settings']).get('clients', []):
+            if client['email'] not in clients:
+                snapshot = canonical_client(api, client['email'])
+                client_update_payload(snapshot)
+                clients[client['email']] = snapshot
+    backup = Path(state.get('backup_dir', '/root/selfsteal-3xui/backups')) / ('chain-' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + secrets.token_hex(3)) / 'panel-before.json'
+    journal = {'before': [copy.deepcopy(before) for before, _ in plan], 'backup': str(backup),
+               'new_id': extra['id'] if extra else None, 'clients': list(clients.values())}
+    secure_json(backup, journal)
+    state['last_chain_backup'] = str(backup)
+    state['pending_chain'] = journal
+    save()
+    try:
+        for _, after in reversed(plan):
+            api.call('panel/api/inbounds/update/%s' % after['id'], payload(after))
+        current = {row['id']: row for row in api.list()}
+        for before, after in plan:
+            actual = current[after['id']]
+            if (parse(actual['streamSettings']) != parse(after['streamSettings'])
+                    or parse(actual['settings']) != parse(before['settings'])):
+                raise RuntimeError('Панель не подтвердила цепочку или сохранила другие параметры клиентов')
+        for snapshot in clients.values():
+            check_client_binding(api, snapshot, snapshot.get('inboundIds') or [])
+        api.restart()
+        wait_chain_runtime(state, [(before, current[after['id']]) for before, after in plan])
+    except Exception:
+        restore_chain(api, state, save)
+        raise
+
+
+def repair_chain(state, save):
+    if state.get('removed') or state.get('pending_add_inbound') or state.get('pending_chain'):
+        raise RuntimeError('Установка удалена или есть незавершённая операция; сначала проверьте сохранённое состояние')
+    require_version(state)
+    api = API(state)
+    apply_chain(api, state, save)
+    state['reality_chain'] = True
+    state.pop('pending_chain', None)
+    save()
+    ports = [443] + [record['port'] for record in state.get('added_inbounds') or []] + [state.get('target_port', 9443)]
+    print('Цепочка Reality: ' + ' -> '.join(map(str, ports)))
+    print('Между inbound: xver 0. Перед nginx: xver 1. Fingerprint: firefox.')
+    print('Ключи, пользователи и panel/hosts сохранены. Обновите подписку в приложении.')
+
+
 def add_inbound(state, port, save):
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise RuntimeError('Порт должен быть целым числом от 1 до 65535')
@@ -1256,6 +1436,8 @@ def add_inbound(state, port, save):
         raise RuntimeError('Установка отмечена как удалённая; сначала выполните установку снова')
     if state.get('pending_add_inbound', {}).get('rollback_incomplete'):
         raise RuntimeError('Предыдущий откат не завершён; сначала проверьте сохранённые сведения об inbound и пользователе в панели')
+    if state.get('pending_chain'):
+        raise RuntimeError('Есть незавершённое изменение цепочки; проверьте сохранённое состояние')
     domain = state.get('domain', '')
     if not domain or not state.get('panel_username') or not state.get('panel_password'):
         raise RuntimeError('В сохранённом состоянии нет домена или данных входа в панель')
@@ -1384,6 +1566,8 @@ def add_inbound(state, port, save):
 
     created_id = None
     group_id = None
+    previous_added = copy.deepcopy(state.get('added_inbounds') or [])
+    previous_chain = state.get('reality_chain')
     state['pending_add_inbound'] = {'port': port, 'tag': tag, 'remark': host_remark,
                                     'client_email': client_email, 'client_uuid': client_uuid,
                                     'original_client_inbound_ids': sorted(original_client_ids)}
@@ -1425,7 +1609,7 @@ def add_inbound(state, port, save):
                   and (not traffic_limit or (attached.get('usedTraffic') or 0) < traffic_limit))
         expected_clients = {(client_uuid, selected_client.get('flow', ''))} if active else set()
 
-        api.restart()
+        apply_chain(api, state, save, extra=added_inbound)
         runtime_path = Path(state.get('runtime_config', str(Path(state['panel_binary']).parent / 'bin/config.json')))
         runtime_ready = False
         listener_ready = False
@@ -1472,18 +1656,27 @@ def add_inbound(state, port, save):
             'client_uuid': client_uuid,
         })
         state.pop('pending_add_inbound', None)
+        state.pop('pending_chain', None)
+        state['reality_chain'] = True
         save()
         print('Добавлен inbound: ID %s, TCP-порт %d.' % (created_id, port))
         print('panel/hosts: inbound ID %s, адрес %s, порт 443.' % (created_id, domain))
         print('Пользователь: %s; inbound добавлен в его существующую подписку.' % terminal_label(client_email))
         if not active:
             print('Пользователь неактивен или исчерпал лимит; привязка сохранена, доступ остаётся ограниченным.')
-        print('Запись hosts задаёт адрес и порт подписки; сетевой NAT/проброс портов она не настраивает.')
+        ports = [443] + [record['port'] for record in state['added_inbounds']] + [state.get('target_port', 9443)]
+        print('Цепочка Reality: ' + ' -> '.join(map(str, ports)))
     except Exception:
         rollback_errors = []
+        state['added_inbounds'] = previous_added
+        if previous_chain is None:
+            state.pop('reality_chain', None)
+        else:
+            state['reality_chain'] = previous_chain
         owned_id = created_id
         restart_needed = created_id is not None
         try:
+            restore_chain(api, state, save)
             current_inbounds = api.list()
             candidates = [item for item in current_inbounds
                           if item.get('tag') == tag
@@ -1626,9 +1819,15 @@ def verify(state):
         raise RuntimeError('Настроенное локальное входящее подключение на порту 443 не найдено')
     stream = parse(inbound['streamSettings'])
     reality = stream['realitySettings']
-    target = '127.0.0.1:%d' % int(state.get('target_port', 9443))
-    if stream.get('network') != 'tcp' or reality.get('target') != target or reality.get('xver') != 1 or reality.get('serverNames') != [state['domain']] or inbound.get('shareAddrStrategy') != 'custom' or inbound.get('shareAddr') != state['domain']:
+    target, primary_xver = chain_primary_endpoint(state)
+    if stream.get('network') != 'tcp' or reality.get('target') != target or reality.get('xver', 0) != primary_xver or reality.get('serverNames') != [state['domain']] or inbound.get('shareAddrStrategy') != 'custom' or inbound.get('shareAddr') != state['domain']:
         raise RuntimeError('Проверка конфигурации Reality через API панели не пройдена')
+    if state.get('reality_chain'):
+        plan = chain_plan(api, state)
+        for before, after in plan:
+            if parse(before['streamSettings']) != parse(after['streamSettings']):
+                raise RuntimeError('Цепочка Reality изменена; восстановите её через пункт 5')
+        wait_chain_runtime(state, plan)
     checked_uri(api, state, inbound)
     # Runtime file is the consumed bundled-Xray configuration, not just DB state.
     runtime_path = Path(state.get('runtime_config', str(Path(state['panel_binary']).parent / 'bin/config.json')))
@@ -1639,7 +1838,7 @@ def verify(state):
             rows = [r for r in runtime.get('inbounds', []) if r.get('port') == 443 and r.get('tag') == inbound['tag']]
             if rows:
                 rs = rows[0].get('streamSettings', {}).get('realitySettings', {})
-                if rs.get('target', rs.get('dest')) == target and rs.get('privateKey') == reality['privateKey'] and rs.get('shortIds') == reality['shortIds'] and rs.get('serverNames') == [state['domain']] and rs.get('xver') == 1:
+                if rs.get('target', rs.get('dest')) == target and rs.get('privateKey') == reality['privateKey'] and rs.get('shortIds') == reality['shortIds'] and rs.get('serverNames') == [state['domain']] and rs.get('xver', 0) == primary_xver:
                     stats = {s['email']: s.get('enable', True) for s in inbound.get('clientStats', [])}
                     expected = set()
                     for client in parse(inbound['settings'])['clients']:
@@ -1700,7 +1899,7 @@ def export(state):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'export', 'verify', 'rollback', 'route_preflight', 'publish'])
+    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'repair_chain', 'export', 'verify', 'rollback', 'route_preflight', 'publish'])
     parser.add_argument('--state', required=True)
     parser.add_argument('--port', type=int)
     args = parser.parse_args()
@@ -1715,6 +1914,8 @@ def main():
             configure(state, save)
         elif args.command == 'add_inbound':
             add_inbound(state, args.port, save)
+        elif args.command == 'repair_chain':
+            repair_chain(state, save)
         else:
             globals()[args.command](state)
         save()
@@ -1824,21 +2025,27 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if [[ "$ACTION" == add-inbound ]]; then
+if [[ "$ACTION" == add-inbound || "$ACTION" == repair-chain ]]; then
   echo
   echo '==============================================='
-  echo '        3xUI Self-Steal — новый inbound'
+  echo '        3xUI Self-Steal — цепочка Reality'
   echo '==============================================='
   state_file=$(load_install_state || true)
   [[ -n "$state_file" && -r "$state_file" ]] || fail 'Нет сохранённой активной установки с данными панели. Сначала выполните установку.'
-  read -r -p 'Локальный TCP-порт нового inbound: ' ADD_PORT
-  [[ "$ADD_PORT" =~ ^[0-9]{1,5}$ ]] || fail 'Введите целый номер TCP-порта от 1 до 65535.'
-  ADD_PORT=$(python3 - "$state_file" "$STATE" "$ADD_PORT" <<'PY'
+  HELPER_ARGS=()
+  PANEL_ACTION=repair_chain
+  ADD_PORT=0
+  if [[ "$ACTION" == add-inbound ]]; then
+    PANEL_ACTION=add_inbound
+    read -r -p 'Локальный TCP-порт нового inbound: ' ADD_PORT
+    [[ "$ADD_PORT" =~ ^[0-9]{1,5}$ ]] || fail 'Введите целый номер TCP-порта от 1 до 65535.'
+  fi
+  ADD_PORT=$(python3 - "$state_file" "$STATE" "$ADD_PORT" "$ACTION" <<'PY'
 import json,os,re,sys
-source,destination,raw=sys.argv[1:]
+source,destination,raw,action=sys.argv[1:]
 if not re.fullmatch(r'[0-9]{1,5}',raw): sys.exit('Некорректный номер порта.')
 port=int(raw)
-if not 1 <= port <= 65535: sys.exit('Порт должен быть от 1 до 65535.')
+if action=='add-inbound' and not 1 <= port <= 65535: sys.exit('Порт должен быть от 1 до 65535.')
 with open(source) as f: state=json.load(f)
 if state.get('removed'): sys.exit('Сохранённая установка помечена как удалённая; сначала выполните установку снова.')
 required=('domain','panel_url','panel_username','panel_password','inbound_id')
@@ -1849,7 +2056,8 @@ print(port)
 PY
 ) || fail 'Не удалось проверить сохранённое состояние или номер порта.'
   emit_panel_helper > "$PANEL_HELPER"
-  if helper add_inbound --port "$ADD_PORT"; then
+  if [[ "$ACTION" == add-inbound ]]; then HELPER_ARGS=(--port "$ADD_PORT"); fi
+  if helper "$PANEL_ACTION" "${HELPER_ARGS[@]}"; then
     persist_tmp="/root/selfsteal-3xui/state.json.tmp.$$"
     install -m 600 "$STATE" "$persist_tmp"
     mv -f -- "$persist_tmp" /root/selfsteal-3xui/state.json
@@ -1861,13 +2069,13 @@ PY
 import json,sys
 try: state=json.load(open(sys.argv[1]))
 except Exception: sys.exit(1)
-sys.exit(0 if state.get('pending_add_inbound',{}).get('rollback_incomplete') else 1)
+sys.exit(0 if state.get('pending_add_inbound',{}).get('rollback_incomplete') or state.get('pending_chain') else 1)
 PY
     then
       persist_tmp="/root/selfsteal-3xui/state.json.tmp.$$"
       install -m 600 "$STATE" "$persist_tmp"
       mv -f -- "$persist_tmp" /root/selfsteal-3xui/state.json
-      echo 'Откат не завершён: подробности сохранены в состоянии установки; проверьте inbound и panel/hosts в панели.' >&2
+      echo 'Откат не завершён: исходные настройки и подробности сохранены; проверьте цепочку, inbound и panel/hosts в панели.' >&2
     fi
     exit "$rc"
   fi
@@ -1955,6 +2163,15 @@ s['ufw_was_active']=os.environ['UFW_WAS_ACTIVE'] == '1'
 s['cert_was_present']=os.environ['CERT_WAS_PRESENT'] == '1'
 s['packages_added_by_script']=[]
 s['removed']=False
+from pathlib import Path
+previous=Path('/root/selfsteal-3xui/state.json')
+if previous.is_file():
+    old=json.loads(previous.read_text())
+    if old.get('domain')==s['domain'] and not old.get('removed'):
+        if old.get('pending_chain') or old.get('pending_add_inbound'):
+            sys.exit('Есть незавершённая операция с inbound; сначала проверьте сохранённое состояние.')
+        for key in ('added_inbounds','reality_chain'):
+            if key in old: s[key]=old[key]
 with open(sys.argv[1],'w') as f: json.dump(s,f)
 os.chmod(sys.argv[1],0o600)
 PY
