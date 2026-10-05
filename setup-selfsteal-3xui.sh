@@ -332,7 +332,7 @@ uninstall_script() {
   echo '        3xUI Self-Steal — удаление'
   echo '==============================================='
 
-  local state_file
+  local state_file nginx_reload_status='not-active'
   state_file=$(load_install_state || true)
   [[ -n "$state_file" && -r "$state_file" ]] || fail 'Не найдено сохранённое состояние установки. Нужен state.json или final-state.json из резервной копии.'
   command -v python3 >/dev/null || fail 'Для удаления требуется python3.'
@@ -523,6 +523,16 @@ for svc,meta in s.get('services_before',{}).items():
         subprocess.run(['systemctl','stop',svc],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 PY
 
+  # Config files were restored above. Reload nginx after restoring its service
+  # state so old worker processes do not keep removed 9443 listeners open.
+  if command -v nginx >/dev/null && systemctl is-active --quiet nginx; then
+    if nginx -t && systemctl reload nginx; then
+      nginx_reload_status='reloaded'
+    else
+      nginx_reload_status='failed'
+    fi
+  fi
+
   python3 - "$state_file" <<'PY'
 import json,time,sys
 p=sys.argv[1]
@@ -535,6 +545,11 @@ PY
   echo
   echo 'Удаление завершено.'
   echo 'Предсуществующие конфигурации восстановлены.'
+  if [[ "$nginx_reload_status" == reloaded ]]; then
+    echo 'Конфигурация nginx перечитана.'
+  elif [[ "$nginx_reload_status" == failed ]]; then
+    echo 'ВНИМАНИЕ: nginx не перечитал конфигурацию; старый listener может оставаться активным. Проверьте nginx -t и выполните systemctl reload nginx.'
+  fi
   echo 'Резервные копии и результаты оставлены в /root/selfsteal-3xui/.'
   exit 0
 }
