@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
+# Managed command: Fovway/3xui-selfsteal
 # Interactive, fail-closed self-steal Reality setup; official 3x-ui v3.8.5.
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
+SCRIPT_COMMAND=/usr/local/bin/selfsteal
+SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
+SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
+SCRIPT_MARKER='# Managed command: Fovway/3xui-selfsteal'
 # Network checks must observe this machine, not an inherited proxy.
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY
 CHECK=0
@@ -11,8 +16,11 @@ ACTION='menu'
 while (( $# )); do
   case $1 in
     --help|-h) cat <<'HELP'
-Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check]
-Без аргументов открывается меню: установка, добавление inbound, удаление компонентов этого скрипта или проверка текущего состояния.
+Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script]
+Без аргументов открывается главное меню. При первом запуске меню устанавливается команда selfsteal.
+--install-script устанавливает текущую копию скрипта как /usr/local/bin/selfsteal.
+--update-script обновляет команду selfsteal из main на GitHub после проверки синтаксиса.
+--uninstall-script удаляет только команду selfsteal, сохраняя настройку сервера.
 --install запускает установку/настройку.
 --add-inbound добавляет VLESS + Reality inbound, привязывает его к выбранному существующему пользователю и создаёт запись panel/hosts для сохранённого домена:443.
 --repair-chain связывает уже созданные скриптом inbound в цепочку 443 -> дополнительные порты -> nginx и устанавливает fingerprint firefox.
@@ -27,6 +35,9 @@ while (( $# )); do
 HELP
       exit 0 ;;
     --check) CHECK=1; ACTION=preflight; shift ;;
+    --uninstall-script) ACTION=uninstall-script; shift ;;
+    --install-script) ACTION=install-script; shift ;;
+    --update-script) ACTION=update-script; shift ;;
     --install) ACTION=install; shift ;;
     --add-inbound) ACTION=add-inbound; shift ;;
     --repair-chain) ACTION=repair-chain; shift ;;
@@ -40,29 +51,91 @@ done
 [[ -z $DOMAIN || $CHECK == 1 ]] || { echo '--domain поддерживается только вместе с --check' >&2; exit 2; }
 fail() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 
+# Management actions do not change the server installation or its state.
+install_script_command() (
+  local source=${1:-${BASH_SOURCE[0]}} temporary=''
+  trap '[[ -z "$temporary" ]] || rm -f -- "$temporary"' EXIT
+  [[ -f "$source" ]] || fail 'Не найден исходный файл скрипта.'
+  grep -Fqx "$SCRIPT_MARKER" "$source" || fail 'Файл не является скриптом Fovway/3xui-selfsteal.'
+  bash -n "$source" || fail 'Синтаксис скрипта некорректен; установленная команда сохранена.'
+  [[ ! -L "$SCRIPT_COMMAND" ]] || fail "Команда $SCRIPT_COMMAND является ссылкой; замена отменена."
+  if [[ -e "$SCRIPT_COMMAND" ]]; then
+    [[ -f "$SCRIPT_COMMAND" ]] && grep -Fqx "$SCRIPT_MARKER" "$SCRIPT_COMMAND" || fail "Путь $SCRIPT_COMMAND занят другим файлом."
+    if cmp -s "$source" "$SCRIPT_COMMAND"; then
+      printf 'Команда selfsteal уже установлена: %s\n' "$SCRIPT_COMMAND"
+      return 0
+    fi
+    install -d -m 700 "$(dirname "$SCRIPT_BACKUP")"
+    install -m 600 "$SCRIPT_COMMAND" "$SCRIPT_BACKUP"
+  fi
+  install -d -m 755 "$(dirname "$SCRIPT_COMMAND")"
+  temporary=$(mktemp "$(dirname "$SCRIPT_COMMAND")/.selfsteal.XXXXXXXX")
+  install -m 755 "$source" "$temporary"
+  mv -f -- "$temporary" "$SCRIPT_COMMAND"
+  temporary=''
+  printf 'Команда установлена: %s\nЗапуск меню: selfsteal (или sudo selfsteal).\n' "$SCRIPT_COMMAND"
+)
+
+update_script_command() (
+  local download
+  command -v curl >/dev/null || fail 'Для обновления требуется curl.'
+  download=$(mktemp /tmp/selfsteal-update.XXXXXXXX)
+  trap 'rm -f -- "$download"' EXIT
+  echo 'Загрузка последней версии скрипта из GitHub...'
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$SCRIPT_URL" -o "$download" || fail 'Не удалось скачать обновление; установленная команда сохранена.'
+  [[ -s "$download" ]] || fail 'GitHub вернул пустой файл; установленная команда сохранена.'
+  install_script_command "$download"
+  echo 'Обновление завершено. Откройте новое меню командой selfsteal.'
+)
+
+uninstall_script_command() {
+  local answer
+  [[ ! -L "$SCRIPT_COMMAND" ]] || fail "Команда $SCRIPT_COMMAND является ссылкой; удаление отменено."
+  if [[ ! -e "$SCRIPT_COMMAND" ]]; then
+    echo 'Команда selfsteal не установлена.'
+    return 0
+  fi
+  [[ -f "$SCRIPT_COMMAND" ]] && grep -Fqx "$SCRIPT_MARKER" "$SCRIPT_COMMAND" || fail "Путь $SCRIPT_COMMAND занят другим файлом; удаление отменено."
+  echo 'Будет удалена только команда selfsteal. Настройка сервера и резервные копии сохраняются.'
+  read -r -p 'Для удаления команды введите REMOVE (иначе отмена): ' answer
+  [[ "$answer" == REMOVE ]] || fail 'Удаление команды отменено.'
+  rm -f -- "$SCRIPT_COMMAND"
+  echo 'Команда selfsteal удалена. Для повторной установки скачайте скрипт с GitHub.'
+}
+
 show_menu() {
-  local choice
-  echo
-  echo '==============================================='
-  echo '        3xUI Self-Steal — главное меню'
-  echo '==============================================='
-  echo '1) Установить / настроить self-steal'
-  echo '2) Удалить всё, что установил этот скрипт'
-  echo '3) Проверить установку и текущую настройку'
-  echo '4) Добавить inbound и привязать к существующему пользователю'
-  echo '5) Исправить цепочку ранее созданных inbound'
-  echo '0) Выход'
-  echo
+  local choice cyan='' green='' amber='' red='' dim='' reset=''
+  if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
+    cyan=$'\033[1;36m'; green=$'\033[1;32m'; amber=$'\033[1;33m'
+    red=$'\033[1;31m'; dim=$'\033[90m'; reset=$'\033[0m'
+  fi
+  printf '\n%s  3x-ui self-steal by Fovway%s\n' "$cyan" "$reset"
+  printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
+  printf '\n%s  НАСТРОЙКА%s\n' "$green" "$reset"
+  printf '    %s1)%s Установить / настроить self-steal\n' "$green" "$reset"
+  printf '    %s2)%s Добавить inbound и привязать пользователя\n' "$green" "$reset"
+  printf '\n%s  ПРОВЕРКА И ОБСЛУЖИВАНИЕ%s\n' "$amber" "$reset"
+  printf '    %s3)%s Проверить установку и конфигурацию\n' "$amber" "$reset"
+  printf '    %s4)%s Исправить цепочку inbound\n' "$amber" "$reset"
+  printf '    %s5)%s Обновить скрипт из GitHub\n' "$amber" "$reset"
+  printf '\n%s  УДАЛЕНИЕ%s\n' "$red" "$reset"
+  printf '    %s6)%s Удалить компоненты скрипта\n' "$red" "$reset"
+  printf '    %s7)%s Удалить команду selfsteal\n' "$red" "$reset"
+  printf '\n%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
+  printf '    0) Выход\n\n'
   while :; do
-    read -r -p 'Выберите пункт [1-5, 0]: ' choice
+    printf '%sВыберите пункт [0–7]: %s' "$cyan" "$reset"
+    read -r choice || return 1
     case "$choice" in
       1) ACTION=install; return ;;
-      2) ACTION=uninstall; return ;;
+      2) ACTION=add-inbound; return ;;
       3) ACTION=status; return ;;
-      4) ACTION=add-inbound; return ;;
-      5) ACTION=repair-chain; return ;;
+      4) ACTION=repair-chain; return ;;
+      5) ACTION=update-script; return ;;
+      6) ACTION=uninstall; return ;;
+      7) ACTION=uninstall-script; return ;;
       0) exit 0 ;;
-      *) echo 'Введите 1, 2, 3, 4, 5 или 0.' ;;
+      *) echo 'Введите число от 0 до 7.' ;;
     esac
   done
 }
@@ -565,7 +638,12 @@ PY
   exit 0
 }
 
-[[ $EUID == 0 ]] || fail 'Запустите скрипт через sudo bash.'
+[[ $EUID == 0 ]] || fail 'Запустите через sudo selfsteal или sudo bash setup-selfsteal-3xui.sh.'
+case "$ACTION" in
+  install-script) install_script_command; exit 0 ;;
+  uninstall-script) uninstall_script_command; exit 0 ;;
+  update-script) update_script_command; exit 0 ;;
+esac
 [[ -r /etc/os-release ]] || fail 'Не найден файл с информацией об операционной системе.'
 . /etc/os-release
 [[ $ID == ubuntu || $ID == debian ]] || fail 'Поддерживаются только Ubuntu и Debian.'
@@ -573,9 +651,14 @@ PY
 command -v systemctl >/dev/null || fail 'Не найден systemctl; требуется система с работающим systemd.'
 
 if [[ "$ACTION" == menu ]]; then
+  if [[ ! -e "$SCRIPT_COMMAND" && ! -L "$SCRIPT_COMMAND" ]]; then
+    install_script_command
+  fi
   show_menu
 fi
 case "$ACTION" in
+  uninstall-script) uninstall_script_command; exit 0 ;;
+  update-script) update_script_command; exit 0 ;;
   uninstall) uninstall_script ;;
   status) status_report ;;
 esac
@@ -1223,7 +1306,7 @@ def choose_existing_client(api):
             eligible.append(client)
     eligible.sort(key=lambda client: str(client['email']).casefold())
     if not eligible:
-        raise RuntimeError('Нет существующих пользователей с UUID для VLESS. Добавьте пользователя в панели и повторите пункт 4.')
+        raise RuntimeError('Нет существующих пользователей с UUID для VLESS. Добавьте пользователя в панели и повторите пункт 2.')
     print('\n--- Привязка к пользователю ---')
     for number, client in enumerate(eligible, 1):
         status = 'включён' if client.get('enable', True) else 'выключен'
@@ -1826,7 +1909,7 @@ def verify(state):
         plan = chain_plan(api, state)
         for before, after in plan:
             if parse(before['streamSettings']) != parse(after['streamSettings']):
-                raise RuntimeError('Цепочка Reality изменена; восстановите её через пункт 5')
+                raise RuntimeError('Цепочка Reality изменена; восстановите её через пункт 4')
         wait_chain_runtime(state, plan)
     checked_uri(api, state, inbound)
     # Runtime file is the consumed bundled-Xray configuration, not just DB state.
