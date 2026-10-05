@@ -404,8 +404,8 @@ PY
   else
     echo '3x-ui была установлена этим скриптом и будет удалена.'
   fi
-  read -r -p 'Для подтверждения удаления введите REMOVE SELFSTEAL: ' ANSWER
-  [[ "$ANSWER" == 'REMOVE SELFSTEAL' ]] || fail 'Удаление отменено.'
+  read -r -p 'Для подтверждения удаления введите REMOVE: ' ANSWER
+  [[ "$ANSWER" == 'REMOVE' ]] || fail 'Удаление отменено.'
 
   if [[ "$is_existing" == true ]]; then
     systemctl stop x-ui 2>/dev/null || true
@@ -1943,20 +1943,21 @@ mkdir -p /root/selfsteal-3xui
 cp "$STATE" /root/selfsteal-3xui/state.json
 chmod 600 /root/selfsteal-3xui/state.json
 chmod 600 "$RESULT"/*
-echo "Настройка проверена. Закрытые результаты: $RESULT; резервная копия: $BACKUP"
-if (( FRESH_ROOT )); then echo "Страница-заглушка: $ROOT/index.html; шаблон: $PLACEHOLDER_TEMPLATE"; fi
-echo "Фактический выходной IP прокси: $(cat "$RESULT/proxy-exit-ip.txt")"
-echo 'Ссылка клиента VLESS (секретная; не публикуйте):'
-cat "$RESULT/client.txt"
-cat "$RESULT/client-qr.txt"
-echo "Инструкция и учетные данные панели: $RESULT/access.json (доступ только root)."
+printf '\n============================================================\n'
+printf '  УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА\n'
+printf '============================================================\n'
+
+echo
+echo '--- Панель 3x-ui ---'
 python3 - "$RESULT/access.json" <<'PY'
 import json,sys
 a=json.load(open(sys.argv[1]))
-print('SSH-туннель:',a['ssh_tunnel'])
-print('Откройте локально:',a['browser_url'])
+print('  Локальный URL:    ' + a['browser_url'])
+print('  Логин:            ' + a['username'])
+print('  Пароль:           ' + a['password'])
+print('  SSH-туннель:      ' + a['ssh_tunnel'])
 if a.get('public_url'):
-    print('Публичная HTTPS-панель (секретный путь; требуется пароль):',a['public_url'])
+    print('  Публичный URL:    ' + a['public_url'])
 statuses = {
     'disabled': 'публикация отключена',
     'disabled-managed-route-removed': 'публикация отключена; маршрут скрипта удален',
@@ -1964,6 +1965,27 @@ statuses = {
     'existing-custom-route-preserved': 'существующий пользовательский маршрут сохранен',
     'enabled-managed-route': 'публикация включена; маршрут создан скриптом',
 }
-print('Статус публичной панели:', statuses.get(a['public_panel_status'], a['public_panel_status']))
+print('  Публикация:       ' + statuses.get(a['public_panel_status'], a['public_panel_status']))
+print('  Данные доступа:   ' + sys.argv[1] + ' (только root)')
 PY
+echo '  Сохраните пароль и секретный URL панели в безопасном месте.'
+
+echo
+echo '--- VLESS + Reality ---'
+printf '  Выходной IP прокси: %s\n' "$(cat "$RESULT/proxy-exit-ip.txt")"
+echo '  Секретная ссылка клиента:'
+cat "$RESULT/client.txt"
+
+echo
+echo '--- QR-код клиента ---'
+cat "$RESULT/client-qr.txt"
+
+echo
+echo '--- Файлы и сайт ---'
+printf '  Результаты:       %s\n' "$RESULT"
+printf '  Резервная копия:  %s\n' "$BACKUP"
+if (( FRESH_ROOT )); then
+  printf '  Страница сайта:   %s/index.html\n' "$ROOT"
+  printf '  Шаблон:           %s\n' "$PLACEHOLDER_TEMPLATE"
+fi
 SUCCESS=1
