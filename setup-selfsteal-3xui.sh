@@ -359,8 +359,21 @@ print(str(json.load(open(sys.argv[1])).get('cert_was_present',True)).lower())
 PY
 )
   fresh_root=$(python3 - "$state_file" <<'PY'
-import json,sys
-print(str(json.load(open(sys.argv[1])).get('fresh_root',False)).lower())
+import json,pathlib,sys
+state=json.load(open(sys.argv[1]))
+owned=state.get('fresh_root')
+if owned is None:
+    # Older successful installs did not persist fresh_root. Infer ownership only
+    # when this script's nginx site was absent from that install's pre-change backup.
+    domain=state.get('domain','')
+    expected=f'/etc/nginx/sites-available/selfsteal-3xui-{domain}' if domain else ''
+    site=state.get('nginx_site','')
+    backup_value=state.get('backup_dir')
+    backup=pathlib.Path(backup_value) if backup_value else None
+    relative=pathlib.Path(expected.lstrip('/')) if expected else pathlib.Path('/')
+    prior_site=backup/'files'/relative if backup and expected else pathlib.Path('/nonexistent')
+    owned=bool(expected and site == expected and backup and backup.is_dir() and not (prior_site.exists() or prior_site.is_symlink()))
+print(str(bool(owned)).lower())
 PY
 )
   site=$(python3 - "$state_file" <<'PY'
