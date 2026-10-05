@@ -11,9 +11,10 @@ ACTION='menu'
 while (( $# )); do
   case $1 in
     --help|-h) cat <<'HELP'
-Использование: sudo bash setup-selfsteal-3xui.sh [--install|--uninstall|--status|--check]
-Без аргументов открывается меню: установка, удаление компонентов этого скрипта или проверка текущего состояния.
+Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--uninstall|--status|--check]
+Без аргументов открывается меню: установка, добавление inbound, удаление компонентов этого скрипта или проверка текущего состояния.
 --install запускает установку/настройку.
+--add-inbound добавляет VLESS + Reality inbound на введённом TCP-порту и запись panel/hosts для сохранённого домена:443.
 --uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
 --status показывает состояние по пунктам без изменений.
 --check выполняет предварительную проверку системы, DNS и конфликтов без изменений и запроса учетных данных.
@@ -26,6 +27,7 @@ HELP
       exit 0 ;;
     --check) CHECK=1; ACTION=preflight; shift ;;
     --install) ACTION=install; shift ;;
+    --add-inbound) ACTION=add-inbound; shift ;;
     --uninstall|--remove) ACTION=uninstall; shift ;;
     --status) ACTION=status; shift ;;
     --menu) ACTION=menu; shift ;;
@@ -45,16 +47,18 @@ show_menu() {
   echo '1) Установить / настроить self-steal'
   echo '2) Удалить всё, что установил этот скрипт'
   echo '3) Проверить установку и текущую настройку'
+  echo '4) Добавить inbound с адресом домена и портом 443 в panel/hosts'
   echo '0) Выход'
   echo
   while :; do
-    read -r -p 'Выберите пункт [1-3, 0]: ' choice
+    read -r -p 'Выберите пункт [1-4, 0]: ' choice
     case "$choice" in
       1) ACTION=install; return ;;
       2) ACTION=uninstall; return ;;
       3) ACTION=status; return ;;
+      4) ACTION=add-inbound; return ;;
       0) exit 0 ;;
-      *) echo 'Введите 1, 2, 3 или 0.' ;;
+      *) echo 'Введите 1, 2, 3, 4 или 0.' ;;
     esac
   done
 }
@@ -1190,6 +1194,236 @@ def configure(state, save):
         raise
 
 
+def add_inbound(state, port, save):
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise RuntimeError('Порт должен быть целым числом от 1 до 65535')
+    if state.get('removed'):
+        raise RuntimeError('Установка отмечена как удалённая; сначала выполните установку снова')
+    domain = state.get('domain', '')
+    if not domain or not state.get('panel_username') or not state.get('panel_password'):
+        raise RuntimeError('В сохранённом состоянии нет домена или данных входа в панель')
+
+    # Verify the managed 443 Reality inbound and the running Xray configuration
+    # before adding anything. This protects unrelated or incomplete panel setups.
+    api, _ = verify(state)
+    inbounds = api.list()
+    if any(not item.get('nodeId') and int(item.get('port') or 0) == port for item in inbounds):
+        raise RuntimeError('Этот TCP-порт уже назначен существующему inbound')
+    if any(item.get('tag') == 'selfsteal-reality-%d' % port for item in inbounds):
+        raise RuntimeError('Inbound с таким служебным тегом уже существует')
+
+    # Detect listeners that are not represented by a local 3x-ui inbound.
+    sockets = []
+    try:
+        for family, address in ((socket.AF_INET, ('0.0.0.0', port)),
+                                (socket.AF_INET6, ('::', port))):
+            try:
+                sock = socket.socket(family, socket.SOCK_STREAM)
+            except OSError:
+                if family == socket.AF_INET:
+                    raise
+                continue
+            sockets.append(sock)
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.bind(address)
+    except OSError:
+        raise RuntimeError('TCP-порт уже занят локальным процессом') from None
+    finally:
+        for sock in sockets:
+            sock.close()
+
+    base = next((item for item in inbounds if int(item.get('id') or 0) == int(state['inbound_id'])), None)
+    if not base:
+        raise RuntimeError('Управляемый inbound на 443 не найден в панели')
+    base_stream = parse(base.get('streamSettings') or {})
+    if base_stream.get('security') != 'reality' or base_stream.get('network') not in ('tcp', 'raw'):
+        raise RuntimeError('Существующий inbound на 443 несовместим с Reality/TCP')
+
+    tag = 'selfsteal-reality-%d' % port
+    host_remark = 'selfsteal-%d-to-443' % port
+    private = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('=')
+    short_id = secrets.token_hex(8)
+    target = '127.0.0.1:%d' % int(state.get('target_port', 9443))
+    reality = {
+        'show': False,
+        'target': target,
+        'serverNames': [domain],
+        'privateKey': private,
+        'shortIds': [short_id],
+        'xver': 1,
+        'settings': {
+            'publicKey': public_key(private),
+            'fingerprint': 'chrome',
+            'serverName': domain,
+            'spiderX': '/',
+        },
+    }
+    inbound = {
+        'remark': 'selfsteal-reality-%d' % port,
+        'enable': True,
+        'expiryTime': 0,
+        'total': 0,
+        'up': 0,
+        'down': 0,
+        'port': port,
+        'protocol': 'vless',
+        'listen': '',
+        'tag': tag,
+        'trafficReset': 'never',
+        'trafficResetDay': 1,
+        'sniffing': json.dumps({'enabled': True, 'destOverride': ['http', 'tls', 'quic'], 'routeOnly': True}),
+        'settings': json.dumps({'clients': [], 'decryption': 'none', 'fallbacks': []}),
+        'streamSettings': json.dumps({
+            'network': 'tcp',
+            'security': 'reality',
+            'realitySettings': reality,
+            'tcpSettings': {'header': {'type': 'none'}},
+        }),
+        'shareAddrStrategy': 'custom',
+        'shareAddr': domain,
+        'disableFlow': False,
+    }
+    host_payload = {
+        'inboundIds': [],
+        'remark': host_remark,
+        'hosts': [domain],
+        'port': 443,
+        'security': 'same',
+        'sni': '',
+        'hostHeader': '',
+        'path': '',
+        'alpn': [],
+        'isDisabled': False,
+        'isHidden': False,
+        'tags': [],
+    }
+
+    created_id = None
+    group_id = None
+    state['pending_add_inbound'] = {'port': port, 'tag': tag, 'remark': host_remark}
+    save()
+    try:
+        created = api.call('panel/api/inbounds/add', inbound)
+        if isinstance(created, dict) and created.get('id') is not None:
+            created_id = int(created['id'])
+            state['pending_add_inbound']['id'] = created_id
+            save()
+        else:
+            raise RuntimeError('Панель не вернула ID созданного inbound')
+
+        host_payload['inboundIds'] = [created_id]
+        api.call('panel/api/hosts/add', host_payload)
+        groups = api.call('panel/api/hosts/list') or []
+        matches = [group for group in groups
+                   if group.get('inboundIds') == [created_id]
+                   and group.get('remark') == host_remark
+                   and group.get('hosts') == [domain]
+                   and int(group.get('port') or 0) == 443]
+        if len(matches) != 1 or not matches[0].get('groupId'):
+            raise RuntimeError('Запись panel/hosts не удалось подтвердить через API')
+        group_id = str(matches[0]['groupId'])
+
+        api.restart()
+        runtime_path = Path(state.get('runtime_config', str(Path(state['panel_binary']).parent / 'bin/config.json')))
+        runtime_ready = False
+        listener_ready = False
+        for _ in range(30):
+            try:
+                runtime = json.loads(runtime_path.read_text())
+                rows = [row for row in runtime.get('inbounds', [])
+                        if row.get('port') == port and row.get('tag') == tag]
+                if len(rows) == 1:
+                    row = rows[0]
+                    rs = row.get('streamSettings', {}).get('realitySettings', {})
+                    runtime_ready = (
+                        row.get('protocol') == 'vless'
+                        and row.get('settings', {}).get('clients') == []
+                        and rs.get('target', rs.get('dest')) == target
+                        and rs.get('privateKey') == private
+                        and rs.get('shortIds') == [short_id]
+                        and rs.get('serverNames') == [domain]
+                    )
+            except (OSError, ValueError, AttributeError):
+                runtime_ready = False
+            if runtime_ready:
+                try:
+                    with socket.create_connection(('127.0.0.1', port), timeout=0.4):
+                        listener_ready = True
+                except OSError:
+                    listener_ready = False
+            if runtime_ready and listener_ready:
+                break
+            time.sleep(1)
+        if not runtime_ready or not listener_ready:
+            raise RuntimeError('Xray не подтвердил запуск нового inbound на выбранном порту')
+
+        state.setdefault('added_inbounds', []).append({
+            'id': created_id,
+            'port': port,
+            'tag': tag,
+            'host_group_id': group_id,
+            'address': domain,
+            'host_port': 443,
+        })
+        state.pop('pending_add_inbound', None)
+        save()
+        print('Добавлен inbound: ID %s, TCP-порт %d.' % (created_id, port))
+        print('panel/hosts: inbound ID %s, адрес %s, порт 443.' % (created_id, domain))
+        print('Клиент не создавался; его можно добавить в панели к новому inbound.')
+        print('Запись hosts задаёт адрес и порт подписки; сетевой NAT/проброс портов она не настраивает.')
+    except Exception:
+        rollback_errors = []
+        owned_id = created_id
+        restart_needed = created_id is not None
+        try:
+            current_inbounds = api.list()
+            candidates = [item for item in current_inbounds
+                          if item.get('tag') == tag
+                          and int(item.get('port') or 0) == port
+                          and parse(item.get('streamSettings') or {}).get('realitySettings', {}).get('privateKey') == private]
+            if len(candidates) > 1:
+                raise RuntimeError('duplicate owned inbounds')
+            if candidates:
+                owned_id = int(candidates[0]['id'])
+                api.call('panel/api/inbounds/del/%s' % owned_id, {})
+                restart_needed = True
+        except Exception:
+            rollback_errors.append('inbound')
+        try:
+            current_groups = api.call('panel/api/hosts/list') or []
+            candidates = [group for group in current_groups
+                          if owned_id is not None
+                          and group.get('inboundIds') == [owned_id]
+                          and group.get('remark') == host_remark
+                          and group.get('hosts') == [domain]
+                          and int(group.get('port') or 0) == 443]
+            for group in candidates:
+                gid = str(group.get('groupId') or '')
+                if gid:
+                    api.call('panel/api/hosts/bulk/del', {'ids': [gid]})
+        except Exception:
+            rollback_errors.append('panel/hosts')
+        if restart_needed:
+            try:
+                api.restart()
+            except Exception:
+                rollback_errors.append('Xray restart')
+        if rollback_errors:
+            state['pending_add_inbound'] = {
+                'id': created_id,
+                'port': port,
+                'tag': tag,
+                'remark': host_remark,
+                'host_group_id': group_id,
+                'rollback_incomplete': rollback_errors,
+            }
+            save()
+            raise RuntimeError('Не удалось полностью откатить операцию (%s); сохранено состояние для проверки панели' % ', '.join(rollback_errors)) from None
+        state.pop('pending_add_inbound', None)
+        save()
+        raise
+
 def rollback(state):
     record = state.get('panel_rollback')
     if not record:
@@ -1349,8 +1583,9 @@ def export(state):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'export', 'verify', 'rollback', 'route_preflight', 'publish'])
+    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'export', 'verify', 'rollback', 'route_preflight', 'publish'])
     parser.add_argument('--state', required=True)
+    parser.add_argument('--port', type=int)
     args = parser.parse_args()
     os.umask(0o077)
     state = json.loads(Path(args.state).read_text())
@@ -1361,6 +1596,8 @@ def main():
     try:
         if args.command == 'configure':
             configure(state, save)
+        elif args.command == 'add_inbound':
+            add_inbound(state, args.port, save)
         else:
             globals()[args.command](state)
         save()
@@ -1426,7 +1663,7 @@ v=json.load(open(sys.argv[1])).get(sys.argv[2], '')
 print(str(v).lower() if isinstance(v,bool) else v)
 PY
 }
-helper() { python3 "$PANEL_HELPER" "$1" --state "$STATE"; }
+helper() { python3 "$PANEL_HELPER" "$1" --state "$STATE" "${@:2}"; }
 snapshot() {
   local path=$1
   FILES+=("$path")
@@ -1470,6 +1707,55 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if [[ "$ACTION" == add-inbound ]]; then
+  echo
+  echo '==============================================='
+  echo '        3xUI Self-Steal — новый inbound'
+  echo '==============================================='
+  state_file=$(load_install_state || true)
+  [[ -n "$state_file" && -r "$state_file" ]] || fail 'Нет сохранённой активной установки с данными панели. Сначала выполните установку.'
+  read -r -p 'Локальный TCP-порт нового inbound: ' ADD_PORT
+  [[ "$ADD_PORT" =~ ^[0-9]{1,5}$ ]] || fail 'Введите целый номер TCP-порта от 1 до 65535.'
+  ADD_PORT=$(python3 - "$state_file" "$STATE" "$ADD_PORT" <<'PY'
+import json,os,re,sys
+source,destination,raw=sys.argv[1:]
+if not re.fullmatch(r'[0-9]{1,5}',raw): sys.exit('Некорректный номер порта.')
+port=int(raw)
+if not 1 <= port <= 65535: sys.exit('Порт должен быть от 1 до 65535.')
+with open(source) as f: state=json.load(f)
+if state.get('removed'): sys.exit('Сохранённая установка помечена как удалённая; сначала выполните установку снова.')
+required=('domain','panel_url','panel_username','panel_password','inbound_id')
+if any(not state.get(key) for key in required): sys.exit('В состоянии установки отсутствуют домен, inbound или данные входа в панель.')
+with open(destination,'w') as f: json.dump(state,f)
+os.chmod(destination,0o600)
+print(port)
+PY
+) || fail 'Не удалось проверить сохранённое состояние или номер порта.'
+  emit_panel_helper > "$PANEL_HELPER"
+  if helper add_inbound --port "$ADD_PORT"; then
+    persist_tmp="/root/selfsteal-3xui/state.json.tmp.$$"
+    install -m 600 "$STATE" "$persist_tmp"
+    mv -f -- "$persist_tmp" /root/selfsteal-3xui/state.json
+    SUCCESS=1
+    exit 0
+  else
+    rc=$?
+    if python3 - "$STATE" <<'PY'
+import json,sys
+try: state=json.load(open(sys.argv[1]))
+except Exception: sys.exit(1)
+sys.exit(0 if state.get('pending_add_inbound',{}).get('rollback_incomplete') else 1)
+PY
+    then
+      persist_tmp="/root/selfsteal-3xui/state.json.tmp.$$"
+      install -m 600 "$STATE" "$persist_tmp"
+      mv -f -- "$persist_tmp" /root/selfsteal-3xui/state.json
+      echo 'Откат не завершён: подробности сохранены в состоянии установки; проверьте inbound и panel/hosts в панели.' >&2
+    fi
+    exit "$rc"
+  fi
+fi
+
 if [[ -z $DOMAIN ]]; then read -r -p 'Домен (полное имя, без http:// или https://): ' DOMAIN; fi
 DOMAIN=${DOMAIN,,}
 CERT_WAS_PRESENT=0
@@ -2004,3 +2290,4 @@ if (( FRESH_ROOT )); then
   printf '  Шаблон:           %s\n' "$PLACEHOLDER_TEMPLATE"
 fi
 SUCCESS=1
+
