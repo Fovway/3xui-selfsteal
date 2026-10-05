@@ -1169,7 +1169,7 @@ def configure(state, save):
     domain = state['domain']
     reality.update(target='127.0.0.1:%d' % int(state.get('target_port', 9443)), serverNames=[domain], xver=1)
     reality.pop('dest', None)
-    reality.setdefault('settings', {}).update(publicKey=public_key(reality['privateKey']), fingerprint='chrome', serverName=domain, spiderX='/')
+    reality.setdefault('settings', {}).update(publicKey=public_key(reality['privateKey']), fingerprint='firefox', serverName=domain, spiderX='/')
     stream.update(network='tcp', security='reality', realitySettings=reality, tcpSettings={'header': {'type': 'none'}})
     # Remove incompatible transport-specific structures during canonical TCP cutover.
     for key in ('rawSettings', 'wsSettings', 'grpcSettings', 'xhttpSettings', 'httpupgradeSettings', 'kcpSettings'):
@@ -1337,7 +1337,7 @@ def add_inbound(state, port, save):
         'xver': 1,
         'settings': {
             'publicKey': public_key(private),
-            'fingerprint': 'chrome',
+            'fingerprint': 'firefox',
             'serverName': domain,
             'spiderX': '/',
         },
