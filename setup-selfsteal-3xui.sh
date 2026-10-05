@@ -14,7 +14,7 @@ while (( $# )); do
 Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--uninstall|--status|--check]
 Без аргументов открывается меню: установка, добавление inbound, удаление компонентов этого скрипта или проверка текущего состояния.
 --install запускает установку/настройку.
---add-inbound добавляет VLESS + Reality inbound на введённом TCP-порту и запись panel/hosts для сохранённого домена:443.
+--add-inbound добавляет VLESS + Reality inbound, привязывает его к выбранному существующему пользователю и создаёт запись panel/hosts для сохранённого домена:443.
 --uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
 --status показывает состояние по пунктам без изменений.
 --check выполняет предварительную проверку системы, DNS и конфликтов без изменений и запроса учетных данных.
@@ -47,7 +47,7 @@ show_menu() {
   echo '1) Установить / настроить self-steal'
   echo '2) Удалить всё, что установил этот скрипт'
   echo '3) Проверить установку и текущую настройку'
-  echo '4) Добавить inbound с адресом домена и портом 443 в panel/hosts'
+  echo '4) Добавить inbound и привязать к существующему пользователю'
   echo '0) Выход'
   echo
   while :; do
@@ -1199,11 +1199,63 @@ def host_group_has_address(group, domain, port=443):
     return hosts in ([domain], ['%s:%d' % (domain, port)])
 
 
+def terminal_label(value):
+    return ''.join(char if char.isprintable() else '?' for char in str(value))
+
+
+def choose_existing_client(api):
+    clients = api.call('panel/api/clients/list') or []
+    eligible = []
+    for client in clients:
+        try:
+            uuid.UUID(client.get('uuid') or '')
+        except (ValueError, AttributeError, TypeError):
+            continue
+        if client.get('email'):
+            eligible.append(client)
+    eligible.sort(key=lambda client: str(client['email']).casefold())
+    if not eligible:
+        raise RuntimeError('Нет существующих пользователей с UUID для VLESS. Добавьте пользователя в панели и повторите пункт 4.')
+    print('\n--- Привязка к пользователю ---')
+    for number, client in enumerate(eligible, 1):
+        status = 'включён' if client.get('enable', True) else 'выключен'
+        print('  %d) %s [%s]' % (number, terminal_label(client['email']), status))
+    print('  0) Отмена')
+    while True:
+        try:
+            answer = input('Выберите пользователя [1-%d, 0]: ' % len(eligible)).strip()
+        except (EOFError, KeyboardInterrupt):
+            raise RuntimeError('Отменено до создания inbound') from None
+        if answer == '0':
+            raise RuntimeError('Отменено до создания inbound')
+        if answer.isascii() and answer.isdigit() and 1 <= int(answer) <= len(eligible):
+            selected = eligible[int(answer) - 1]
+            snapshot = canonical_client(api, selected['email'])
+            if snapshot['client'].get('uuid') != selected['uuid']:
+                raise RuntimeError('Выбранный пользователь изменился; повторите выбор')
+            client_update_payload(snapshot)  # Validate the canonical schema before mutation.
+            if snapshot['client'].get('flow', '') not in ('', 'xtls-rprx-vision'):
+                raise RuntimeError('Flow выбранного пользователя несовместим с VLESS + Reality/TCP')
+            return snapshot
+        print('Введите номер пользователя из списка или 0 для отмены.')
+
+
+def check_client_binding(api, snapshot, inbound_ids):
+    current = canonical_client(api, snapshot['client']['email'])
+    if (current['client'].get('uuid') != snapshot['client']['uuid']
+            or client_behavior(current) != client_behavior(snapshot)
+            or set(current.get('inboundIds') or []) != set(inbound_ids)):
+        raise RuntimeError('Не удалось подтвердить привязку и сохранность параметров пользователя')
+    return current
+
+
 def add_inbound(state, port, save):
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise RuntimeError('Порт должен быть целым числом от 1 до 65535')
     if state.get('removed'):
         raise RuntimeError('Установка отмечена как удалённая; сначала выполните установку снова')
+    if state.get('pending_add_inbound', {}).get('rollback_incomplete'):
+        raise RuntimeError('Предыдущий откат не завершён; сначала проверьте сохранённые сведения об inbound и пользователе в панели')
     domain = state.get('domain', '')
     if not domain or not state.get('panel_username') or not state.get('panel_password'):
         raise RuntimeError('В сохранённом состоянии нет домена или данных входа в панель')
@@ -1244,6 +1296,11 @@ def add_inbound(state, port, save):
     base_stream = parse(base.get('streamSettings') or {})
     if base_stream.get('security') != 'reality' or base_stream.get('network') not in ('tcp', 'raw'):
         raise RuntimeError('Существующий inbound на 443 несовместим с Reality/TCP')
+
+    client_snapshot = choose_existing_client(api)
+    client_email = client_snapshot['client']['email']
+    client_uuid = client_snapshot['client']['uuid']
+    original_client_ids = set(client_snapshot.get('inboundIds') or [])
 
     tag = 'selfsteal-reality-%d' % port
     host_remark = 'selfsteal-%d-to-443' % port
@@ -1327,7 +1384,9 @@ def add_inbound(state, port, save):
 
     created_id = None
     group_id = None
-    state['pending_add_inbound'] = {'port': port, 'tag': tag, 'remark': host_remark}
+    state['pending_add_inbound'] = {'port': port, 'tag': tag, 'remark': host_remark,
+                                    'client_email': client_email, 'client_uuid': client_uuid,
+                                    'original_client_inbound_ids': sorted(original_client_ids)}
     save()
     try:
         created = api.call('panel/api/inbounds/add', inbound)
@@ -1350,6 +1409,22 @@ def add_inbound(state, port, save):
             raise RuntimeError('Запись panel/hosts не удалось подтвердить через API')
         group_id = str(matches[0]['groupId'])
 
+        check_client_binding(api, client_snapshot, original_client_ids)
+        api.call('panel/api/clients/%s/attach' % urllib.parse.quote(client_email, safe=''),
+                 {'inboundIds': [created_id]})
+        attached = check_client_binding(api, client_snapshot, original_client_ids | {created_id})
+        added_inbound = next((item for item in api.list() if item.get('id') == created_id), None)
+        added_clients = parse(added_inbound['settings']).get('clients', []) if added_inbound else []
+        if (len(added_clients) != 1 or added_clients[0].get('id') != client_uuid
+                or added_clients[0].get('email') != client_email
+                or added_clients[0].get('flow', '') != client_snapshot['client'].get('flow', '')):
+            raise RuntimeError('Новый inbound не подтвердил выбранного пользователя')
+        selected_client = added_clients[0]
+        traffic_limit = attached['client'].get('totalGB') or 0
+        active = (client_active(selected_client, added_inbound)
+                  and (not traffic_limit or (attached.get('usedTraffic') or 0) < traffic_limit))
+        expected_clients = {(client_uuid, selected_client.get('flow', ''))} if active else set()
+
         api.restart()
         runtime_path = Path(state.get('runtime_config', str(Path(state['panel_binary']).parent / 'bin/config.json')))
         runtime_ready = False
@@ -1364,7 +1439,9 @@ def add_inbound(state, port, save):
                     rs = row.get('streamSettings', {}).get('realitySettings', {})
                     runtime_ready = (
                         row.get('protocol') == 'vless'
-                        and row.get('settings', {}).get('clients') == []
+                        and len(row.get('settings', {}).get('clients', [])) == len(expected_clients)
+                        and {(client.get('id'), client.get('flow', ''))
+                             for client in row.get('settings', {}).get('clients', [])} == expected_clients
                         and rs.get('target', rs.get('dest')) == target
                         and rs.get('privateKey') == private
                         and rs.get('shortIds') == [short_id]
@@ -1391,12 +1468,16 @@ def add_inbound(state, port, save):
             'host_group_id': group_id,
             'address': domain,
             'host_port': 443,
+            'client_email': client_email,
+            'client_uuid': client_uuid,
         })
         state.pop('pending_add_inbound', None)
         save()
         print('Добавлен inbound: ID %s, TCP-порт %d.' % (created_id, port))
         print('panel/hosts: inbound ID %s, адрес %s, порт 443.' % (created_id, domain))
-        print('Клиент не создавался; его можно добавить в панели к новому inbound.')
+        print('Пользователь: %s; inbound добавлен в его существующую подписку.' % terminal_label(client_email))
+        if not active:
+            print('Пользователь неактивен или исчерпал лимит; привязка сохранена, доступ остаётся ограниченным.')
         print('Запись hosts задаёт адрес и порт подписки; сетевой NAT/проброс портов она не настраивает.')
     except Exception:
         rollback_errors = []
@@ -1412,8 +1493,15 @@ def add_inbound(state, port, save):
                 raise RuntimeError('duplicate owned inbounds')
             if candidates:
                 owned_id = int(candidates[0]['id'])
+                current_client = canonical_client(api, client_email)
+                if current_client['client'].get('uuid') != client_uuid:
+                    raise RuntimeError('Идентификатор пользователя изменился; автоматический откат отменён')
+                if owned_id in (current_client.get('inboundIds') or []):
+                    api.call('panel/api/clients/%s/detach' % urllib.parse.quote(client_email, safe=''),
+                             {'inboundIds': [owned_id]})
                 api.call('panel/api/inbounds/del/%s' % owned_id, {})
                 restart_needed = True
+                check_client_binding(api, client_snapshot, original_client_ids)
         except Exception:
             rollback_errors.append('inbound')
         try:
@@ -1442,6 +1530,9 @@ def add_inbound(state, port, save):
                 'tag': tag,
                 'remark': host_remark,
                 'host_group_id': group_id,
+                'client_email': client_email,
+                'client_uuid': client_uuid,
+                'original_client_inbound_ids': sorted(original_client_ids),
                 'rollback_incomplete': rollback_errors,
             }
             save()
@@ -2316,4 +2407,3 @@ if (( FRESH_ROOT )); then
   printf '  Шаблон:           %s\n' "$PLACEHOLDER_TEMPLATE"
 fi
 SUCCESS=1
-
