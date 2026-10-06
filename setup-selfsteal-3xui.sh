@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.06.6
+SCRIPT_VERSION=2026.10.06.7
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -113,18 +113,153 @@ uninstall_script_command() {
   echo 'Команда selfsteal удалена. Для повторной установки скачайте скрипт с GitHub.'
 }
 
+ensure_screenshot_dependencies() {
+  if python3 - <<'PY' >/dev/null 2>&1
+from PIL import Image, ImageDraw, ImageFont
+PY
+  then
+    return 0
+  fi
+
+  command -v apt-get >/dev/null 2>&1 || {
+    echo 'Не найден apt-get. Для PNG требуется Python Pillow.'
+    return 1
+  }
+
+  echo 'Для создания PNG требуется пакет python3-pil. Устанавливаю...'
+  DEBIAN_FRONTEND=noninteractive apt-get update || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-pil fonts-dejavu-core || return 1
+}
+
+save_test_screenshot() {
+  local title=$1 log_file=$2 safe_title stamp out_dir out_file host ip
+  ensure_screenshot_dependencies || {
+    echo 'Не удалось установить зависимости для создания PNG.'
+    return 1
+  }
+
+  out_dir=/root/selfsteal-3xui/test-screenshots
+  install -d -m 700 "$out_dir"
+  safe_title=$(printf '%s' "$title" | tr ' /:' '___' | tr -cd '[:alnum:]_.-')
+  [[ -n "$safe_title" ]] || safe_title=test
+  stamp=$(date '+%Y-%m-%d_%H-%M-%S')
+  out_file="$out_dir/${stamp}_${safe_title}.png"
+  host=$(hostname 2>/dev/null || printf 'VPS')
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+  python3 - "$title" "$log_file" "$out_file" "$host" "${ip:-unknown}" <<'PY'
+import re
+import sys
+import textwrap
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
+
+title, log_path, out_path, host, ip = sys.argv[1:]
+raw = Path(log_path).read_text(errors='replace')
+ansi = re.compile(r'\x1B(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))')
+text = ansi.sub('', raw).replace('\r', '')
+
+font_paths = [
+    '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf',
+    '/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf',
+]
+bold_paths = [
+    '/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf',
+    '/usr/share/fonts/truetype/liberation2/LiberationMono-Bold.ttf',
+]
+
+def pick(paths, size):
+    for p in paths:
+        if Path(p).exists():
+            return ImageFont.truetype(p, size)
+    return ImageFont.load_default()
+
+font = pick(font_paths, 24)
+small = pick(font_paths, 19)
+bold = pick(bold_paths, 30)
+title_font = pick(bold_paths, 38)
+
+max_chars = 112
+lines = []
+for original in text.splitlines():
+    if not original:
+        lines.append('')
+        continue
+    chunks = textwrap.wrap(original, width=max_chars, replace_whitespace=False, drop_whitespace=False) or ['']
+    lines.extend(chunks)
+
+if len(lines) > 220:
+    lines = lines[:217] + ['', '... output truncated in screenshot ...']
+
+probe = Image.new('RGB', (10, 10))
+d = ImageDraw.Draw(probe)
+line_h = int(d.textbbox((0, 0), 'Ag', font=font)[3] * 1.35)
+header_h = 170
+footer_h = 70
+pad = 56
+width = 1920
+height = max(700, header_h + footer_h + pad + max(1, len(lines)) * line_h)
+
+img = Image.new('RGB', (width, height), '#0b1020')
+d = ImageDraw.Draw(img)
+
+d.rounded_rectangle((28, 28, width-28, height-28), radius=28, fill='#111827', outline='#334155', width=2)
+d.text((pad, 55), title, font=title_font, fill='#f8fafc')
+d.text((pad, 112), f'{host}  •  {ip}', font=small, fill='#94a3b8')
+d.line((pad, 154, width-pad, 154), fill='#334155', width=2)
+
+y = header_h
+for line in lines:
+    fill = '#e5e7eb'
+    low = line.lower()
+    if '[fail]' in low or 'error' in low or 'ошиб' in low:
+        fill = '#fca5a5'
+    elif '[ok]' in low or 'success' in low or 'passed' in low:
+        fill = '#86efac'
+    elif 'warn' in low or 'вниман' in low:
+        fill = '#fde68a'
+    d.text((pad, y), line, font=font, fill=fill)
+    y += line_h
+
+d.line((pad, height-footer_h, width-pad, height-footer_h), fill='#334155', width=2)
+d.text((pad, height-footer_h+20), '3x-ui self-steal by Fovway • VPS test result', font=small, fill='#64748b')
+img.save(out_path, 'PNG', optimize=True)
+PY
+
+  chmod 600 "$out_file"
+  printf 'PNG сохранён: %s\n' "$out_file"
+}
+
+after_test_menu() {
+  local title=$1 log_file=$2 choice
+  while :; do
+    printf '\n1) Сохранить красивый PNG\n'
+    printf '2) Вернуться к тестам\n'
+    printf 'Выберите действие [1–2]: '
+    read -r choice || choice=2
+    case "$choice" in
+      1) save_test_screenshot "$title" "$log_file" ;;
+      2) rm -f -- "$log_file"; return 0 ;;
+      *) echo 'Введите 1 или 2.' ;;
+    esac
+  done
+}
+
 run_vps_test() {
-  local title=$1 command=$2 rc=0 dummy
+  local title=$1 command=$2 rc=0 log_file
+  local -a ps
+  log_file=$(mktemp /tmp/selfsteal-vps-test.XXXXXXXX.log)
   printf '\n────────────────────────────────────────────────────────────────\n'
   printf '  %s\n' "$title"
   printf '────────────────────────────────────────────────────────────────\n'
   printf 'Команда: %s\n\n' "$command"
 
-  if bash -lc "$command"; then
-    rc=0
+  if bash -lc "$command" 2>&1 | tee "$log_file"; then
+    ps=("${PIPESTATUS[@]}")
   else
-    rc=$?
+    ps=("${PIPESTATUS[@]}")
   fi
+  rc=${ps[0]:-1}
 
   printf '\n'
   if (( rc == 0 )); then
@@ -132,36 +267,38 @@ run_vps_test() {
   else
     printf 'Тест завершился с кодом %d.\n' "$rc"
   fi
-  read -r -p 'Нажмите Enter, чтобы вернуться к тестам...' dummy || true
+  after_test_menu "$title" "$log_file"
 }
+
 run_rkn_block_checker() {
-  local venv=/tmp/selfsteal-rkn-checker-venv rc=0 dummy
+  local venv=/tmp/selfsteal-rkn-checker-venv rc=0 log_file
+  local -a ps
+  log_file=$(mktemp /tmp/selfsteal-vps-test.XXXXXXXX.log)
   printf '\n────────────────────────────────────────────────────────────────\n'
   printf '  RKN Block Checker\n'
   printf '────────────────────────────────────────────────────────────────\n\n'
 
-  if command -v rkn-check >/dev/null 2>&1; then
-    rkn-check || rc=$?
-  else
-    command -v python3 >/dev/null 2>&1 || {
-      echo 'Не найден python3.'
-      rc=1
-    }
-    if (( rc == 0 )); then
+  if {
+    if command -v rkn-check >/dev/null 2>&1; then
+      rkn-check
+    else
+      command -v python3 >/dev/null 2>&1 || { echo 'Не найден python3.'; exit 1; }
       rm -rf -- "$venv"
-      if ! python3 -m venv "$venv" >/dev/null 2>&1; then
+      python3 -m venv "$venv" >/dev/null 2>&1 || {
         echo 'Не удалось создать временное Python-окружение.'
         echo 'Установите пакет python3-venv и повторите тест.'
-        rc=1
-      else
-        "$venv/bin/python" -m pip install --quiet --disable-pip-version-check rkn-block-checker || rc=$?
-        if (( rc == 0 )); then
-          "$venv/bin/rkn-check" || rc=$?
-        fi
-      fi
-      rm -rf -- "$venv"
+        exit 1
+      }
+      "$venv/bin/python" -m pip install --quiet --disable-pip-version-check rkn-block-checker || exit $?
+      "$venv/bin/rkn-check"
     fi
+  } 2>&1 | tee "$log_file"; then
+    ps=("${PIPESTATUS[@]}")
+  else
+    ps=("${PIPESTATUS[@]}")
   fi
+  rc=${ps[0]:-1}
+  rm -rf -- "$venv"
 
   printf '\n'
   if (( rc == 0 )); then
@@ -169,7 +306,7 @@ run_rkn_block_checker() {
   else
     printf 'Тест завершился с кодом %d.\n' "$rc"
   fi
-  read -r -p 'Нажмите Enter, чтобы вернуться к тестам...' dummy || true
+  after_test_menu 'RKN Block Checker' "$log_file"
 }
 
 show_vps_tests_menu() {
