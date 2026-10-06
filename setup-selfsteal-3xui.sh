@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.06.10
+SCRIPT_VERSION=2026.10.06.11
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -134,7 +134,7 @@ PY
 }
 
 save_test_screenshot() {
-  local title=$1 log_file=$2 safe_title stamp out_dir out_file host
+  local title=$1 log_file=$2 safe_title stamp out_dir out_file host ip masked_ip
   ensure_screenshot_dependencies || {
     echo 'Не удалось установить зависимости для создания PNG.'
     return 1
@@ -147,14 +147,20 @@ save_test_screenshot() {
   stamp=$(date '+%Y-%m-%d_%H-%M-%S')
   out_file="$out_dir/${stamp}_${safe_title}.png"
   host=$(hostname 2>/dev/null || printf 'VPS')
+  ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+(\.[0-9]+){3}$' | head -n1 || true)
+  if [[ "$ip" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+\.[0-9]+$ ]]; then
+    masked_ip="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.*.*"
+  else
+    masked_ip='IP hidden'
+  fi
 
-  python3 - "$title" "$log_file" "$out_file" "$host" <<'PY'
+  python3 - "$title" "$log_file" "$out_file" "$host" "$masked_ip" <<'PY'
 import re
 import sys
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
-title, log_path, out_path, host = sys.argv[1:]
+title, log_path, out_path, host, masked_ip = sys.argv[1:]
 raw = Path(log_path).read_text(errors='replace')
 
 # Убираем OSC-последовательности (например, терминальные гиперссылки).
@@ -307,8 +313,7 @@ img = Image.new('RGB', (width, height), '#0b1020')
 d = ImageDraw.Draw(img)
 d.rounded_rectangle((28, 28, width-28, height-28), radius=28, fill='#111827', outline='#334155', width=2)
 d.text((pad, 55), title, font=title_font, fill='#f8fafc')
-# В шапке намеренно нет IP-адреса сервера.
-d.text((pad, 112), host, font=small, fill='#94a3b8')
+d.text((pad, 112), f'{host}  •  {masked_ip}', font=small, fill='#94a3b8')
 d.line((pad, 154, width-pad, 154), fill='#334155', width=2)
 
 def draw_run(draw, x, y, text, color, is_bold):
