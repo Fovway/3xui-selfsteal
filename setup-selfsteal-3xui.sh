@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.06.13
+SCRIPT_VERSION=2026.10.06.14
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -180,14 +180,55 @@ csi_re = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 def visible_text(s):
     return csi_re.sub('', s)
 
-# В IP-region и похожих тестах строки Checking: ... — это только прогресс.
-# Они нужны в живом CLI, но не в итоговой картинке.
+# Убираем строки прогресса. В живом CLI они остаются, но в PNG не нужны.
 filtered_lines = []
+progress_patterns = [
+    r'(?i)(?:^|\s)checking\s*:',
+    r'(?i)^testing\s+.+\.\.\.',
+    r'(?i)^checking\s+ip\s+database\b',
+    r'(?i)^checking\s+stream\s+media\b',
+    r'(?i)^checking\s+ai\s+provider\b',
+    r'(?i)^connecting\s+email\s+server\b',
+    r'(?i)^checking\s+blacklist\s+database\b',
+]
 for line in physical_lines:
     plain = visible_text(line).strip()
-    if re.search(r'(?i)(?:^|\s)checking\s*:', plain):
+    if any(re.search(p, plain) for p in progress_patterns):
         continue
     filtered_lines.append(line)
+
+def slice_from_last_marker(lines, patterns):
+    for idx in range(len(lines) - 1, -1, -1):
+        plain = visible_text(lines[idx]).strip()
+        if any(re.search(p, plain, re.I) for p in patterns):
+            return lines[idx:]
+    return lines
+
+title_l = title.lower()
+
+# russian-iperf3-servers печатает красивую итоговую таблицу только после
+# служебных spinner-строк. Для PNG оставляем именно этот финальный блок.
+if 'iperf3' in title_l:
+    filtered_lines = slice_from_last_marker(
+        filtered_lines,
+        [r'from the community, for the community', r'^server\s+download\s+upload\s+ping\b'],
+    )
+
+# Оба теста на базе xykt/IPQuality сначала рисуют баннеры и прогресс,
+# а затем печатают готовый итоговый отчёт. Берём последний REPORT-блок.
+if title == 'IPQuality' or 'блокировки зарубежными сервисами' in title_l:
+    filtered_lines = slice_from_last_marker(
+        filtered_lines,
+        [r'ip\s+quality\s+check\s+report'],
+    )
+
+# Убираем остатки управляющих символов, которые не являются ANSI-цветами.
+cleaned = []
+for line in filtered_lines:
+    line = line.replace('\b', '')
+    line = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]', '', line)
+    cleaned.append(line)
+filtered_lines = cleaned
 
 # Убираем лишние пустые строки в начале/конце, но сохраняем разметку внутри.
 while filtered_lines and not visible_text(filtered_lines[0]).strip():
