@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.06.8
+SCRIPT_VERSION=2026.10.06.9
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -134,7 +134,7 @@ PY
 }
 
 save_test_screenshot() {
-  local title=$1 log_file=$2 safe_title stamp out_dir out_file host ip
+  local title=$1 log_file=$2 safe_title stamp out_dir out_file host
   ensure_screenshot_dependencies || {
     echo 'Не удалось установить зависимости для создания PNG.'
     return 1
@@ -147,19 +147,47 @@ save_test_screenshot() {
   stamp=$(date '+%Y-%m-%d_%H-%M-%S')
   out_file="$out_dir/${stamp}_${safe_title}.png"
   host=$(hostname 2>/dev/null || printf 'VPS')
-  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
 
-  python3 - "$title" "$log_file" "$out_file" "$host" "${ip:-unknown}" <<'PY'
+  python3 - "$title" "$log_file" "$out_file" "$host" <<'PY'
 import re
 import sys
-import textwrap
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
-title, log_path, out_path, host, ip = sys.argv[1:]
+title, log_path, out_path, host = sys.argv[1:]
 raw = Path(log_path).read_text(errors='replace')
-ansi = re.compile(r'\x1B(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))')
-text = ansi.sub('', raw).replace('\r', '')
+
+# Убираем OSC-последовательности (например, терминальные гиперссылки).
+raw = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', raw)
+raw = raw.replace('\r\n', '\n')
+
+# Терминальные progress-строки часто перерисовываются через CR.
+# Для PNG оставляем только последнее состояние такой строки.
+physical_lines = []
+for part in raw.split('\n'):
+    if '\r' in part:
+        part = part.split('\r')[-1]
+    physical_lines.append(part)
+
+csi_re = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+
+def visible_text(s):
+    return csi_re.sub('', s)
+
+# В IP-region и похожих тестах строки Checking: ... — это только прогресс.
+# Они нужны в живом CLI, но не в итоговой картинке.
+filtered_lines = []
+for line in physical_lines:
+    plain = visible_text(line).strip()
+    if re.search(r'(?i)(?:^|\s)checking\s*:', plain):
+        continue
+    filtered_lines.append(line)
+
+# Убираем лишние пустые строки в начале/конце, но сохраняем разметку внутри.
+while filtered_lines and not visible_text(filtered_lines[0]).strip():
+    filtered_lines.pop(0)
+while filtered_lines and not visible_text(filtered_lines[-1]).strip():
+    filtered_lines.pop()
 
 font_paths = [
     '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf',
@@ -177,54 +205,139 @@ def pick(paths, size):
     return ImageFont.load_default()
 
 font = pick(font_paths, 24)
+bold_font = pick(bold_paths, 24)
 small = pick(font_paths, 19)
-bold = pick(bold_paths, 30)
 title_font = pick(bold_paths, 38)
 
-max_chars = 112
-lines = []
-for original in text.splitlines():
-    if not original:
-        lines.append('')
-        continue
-    chunks = textwrap.wrap(original, width=max_chars, replace_whitespace=False, drop_whitespace=False) or ['']
-    lines.extend(chunks)
+DEFAULT = '#e5e7eb'
+PALETTE = {
+    30:'#64748b', 31:'#ef4444', 32:'#22c55e', 33:'#eab308',
+    34:'#3b82f6', 35:'#d946ef', 36:'#06b6d4', 37:'#e5e7eb',
+    90:'#94a3b8', 91:'#f87171', 92:'#4ade80', 93:'#facc15',
+    94:'#60a5fa', 95:'#e879f9', 96:'#22d3ee', 97:'#f8fafc',
+}
 
-if len(lines) > 220:
-    lines = lines[:217] + ['', '... output truncated in screenshot ...']
+def xterm256(n):
+    base = ['#000000','#800000','#008000','#808000','#000080','#800080','#008080','#c0c0c0',
+            '#808080','#ff0000','#00ff00','#ffff00','#0000ff','#ff00ff','#00ffff','#ffffff']
+    if 0 <= n < 16:
+        return base[n]
+    if 16 <= n <= 231:
+        n -= 16
+        r, g, b = n // 36, (n % 36) // 6, n % 6
+        vals = [0, 95, 135, 175, 215, 255]
+        return '#%02x%02x%02x' % (vals[r], vals[g], vals[b])
+    if 232 <= n <= 255:
+        v = 8 + (n - 232) * 10
+        return '#%02x%02x%02x' % (v, v, v)
+    return DEFAULT
+
+def apply_sgr(params, color, is_bold):
+    vals = []
+    if not params:
+        vals = [0]
+    else:
+        for x in params.replace(':', ';').split(';'):
+            try:
+                vals.append(int(x) if x else 0)
+            except ValueError:
+                pass
+    i = 0
+    while i < len(vals):
+        code = vals[i]
+        if code == 0:
+            color, is_bold = DEFAULT, False
+        elif code == 1:
+            is_bold = True
+        elif code == 22:
+            is_bold = False
+        elif code == 39:
+            color = DEFAULT
+        elif code in PALETTE:
+            color = PALETTE[code]
+        elif code == 38 and i + 1 < len(vals):
+            if vals[i+1] == 5 and i + 2 < len(vals):
+                color = xterm256(vals[i+2]); i += 2
+            elif vals[i+1] == 2 and i + 4 < len(vals):
+                r, g, b = vals[i+2:i+5]
+                color = '#%02x%02x%02x' % (max(0,min(255,r)), max(0,min(255,g)), max(0,min(255,b)))
+                i += 4
+        i += 1
+    return color, is_bold
+
+def parse_ansi_line(line, state):
+    color, is_bold = state
+    chars = []
+    pos = 0
+    for m in csi_re.finditer(line):
+        before = line[pos:m.start()]
+        chars.extend((ch, color, is_bold) for ch in before)
+        seq = m.group(0)
+        if seq.endswith('m'):
+            params = seq[2:-1]
+            color, is_bold = apply_sgr(params, color, is_bold)
+        pos = m.end()
+    chars.extend((ch, color, is_bold) for ch in line[pos:])
+    return chars, (color, is_bold)
+
+max_chars = 112
+render_lines = []
+state = (DEFAULT, False)
+for raw_line in filtered_lines:
+    chars, state = parse_ansi_line(raw_line, state)
+    if not chars:
+        render_lines.append([])
+        continue
+    for i in range(0, len(chars), max_chars):
+        render_lines.append(chars[i:i+max_chars])
+
+if len(render_lines) > 220:
+    render_lines = render_lines[:217] + [[], [(c, '#94a3b8', False) for c in '... output truncated in screenshot ...']]
 
 probe = Image.new('RGB', (10, 10))
 d = ImageDraw.Draw(probe)
 line_h = int(d.textbbox((0, 0), 'Ag', font=font)[3] * 1.35)
 header_h = 170
-footer_h = 70
+bottom_pad = 56
 pad = 56
 width = 1920
-height = max(700, header_h + footer_h + pad + max(1, len(lines)) * line_h)
+height = max(700, header_h + bottom_pad + max(1, len(render_lines)) * line_h)
 
 img = Image.new('RGB', (width, height), '#0b1020')
 d = ImageDraw.Draw(img)
-
 d.rounded_rectangle((28, 28, width-28, height-28), radius=28, fill='#111827', outline='#334155', width=2)
 d.text((pad, 55), title, font=title_font, fill='#f8fafc')
-d.text((pad, 112), f'{host}  •  {ip}', font=small, fill='#94a3b8')
+# В шапке намеренно нет IP-адреса сервера.
+d.text((pad, 112), host, font=small, fill='#94a3b8')
 d.line((pad, 154, width-pad, 154), fill='#334155', width=2)
 
 y = header_h
-for line in lines:
-    fill = '#e5e7eb'
-    low = line.lower()
-    if '[fail]' in low or 'error' in low or 'ошиб' in low:
-        fill = '#fca5a5'
-    elif '[ok]' in low or 'success' in low or 'passed' in low:
-        fill = '#86efac'
-    elif 'warn' in low or 'вниман' in low:
-        fill = '#fde68a'
-    d.text((pad, y), line, font=font, fill=fill)
+for line in render_lines:
+    x = pad
+    if not line:
+        y += line_h
+        continue
+    run_text = ''
+    run_color = None
+    run_bold = None
+    def flush():
+        nonlocal x, run_text, run_color, run_bold
+        if not run_text:
+            return
+        f = bold_font if run_bold else font
+        d.text((x, y), run_text, font=f, fill=run_color or DEFAULT)
+        x += d.textlength(run_text, font=f)
+        run_text = ''
+    for ch, color, is_bold in line:
+        if run_text and (color != run_color or is_bold != run_bold):
+            flush()
+        if not run_text:
+            run_color, run_bold = color, is_bold
+        run_text += ch
+    flush()
     y += line_h
 
-d.line((pad, height-footer_h, width-pad, height-footer_h), fill='#334155', width=2)
-d.text((pad, height-footer_h+20), '3x-ui self-steal by Fovway • VPS test result', font=small, fill='#64748b')
+# Никакого брендинга self-steal/Fovway внизу изображения.
 img.save(out_path, 'PNG', optimize=True)
 PY
 
@@ -247,21 +360,28 @@ after_test_menu() {
   done
 }
 
+capture_test_command() {
+  local command=$1 log_file=$2 quoted rc
+  if command -v script >/dev/null 2>&1; then
+    printf -v quoted '%q' "$command"
+    TERM=xterm-256color script -qefc "bash -lc $quoted" /dev/null 2>&1 | tee "$log_file"
+    rc=${PIPESTATUS[0]}
+  else
+    TERM=xterm-256color bash -lc "$command" 2>&1 | tee "$log_file"
+    rc=${PIPESTATUS[0]}
+  fi
+  return "$rc"
+}
+
 run_vps_test() {
   local title=$1 command=$2 rc=0 log_file
-  local -a ps
   log_file=$(mktemp /tmp/selfsteal-vps-test.XXXXXXXX.log)
   printf '\n────────────────────────────────────────────────────────────────\n'
   printf '  %s\n' "$title"
   printf '────────────────────────────────────────────────────────────────\n'
   printf 'Команда: %s\n\n' "$command"
 
-  if bash -lc "$command" 2>&1 | tee "$log_file"; then
-    ps=("${PIPESTATUS[@]}")
-  else
-    ps=("${PIPESTATUS[@]}")
-  fi
-  rc=${ps[0]:-1}
+  capture_test_command "$command" "$log_file" || rc=$?
 
   printf '\n'
   if (( rc == 0 )); then
@@ -273,33 +393,38 @@ run_vps_test() {
 }
 
 run_rkn_block_checker() {
-  local venv=/tmp/selfsteal-rkn-checker-venv rc=0 log_file
-  local -a ps
+  local venv=/tmp/selfsteal-rkn-checker-venv rc=0 log_file rkn_cmd
   log_file=$(mktemp /tmp/selfsteal-vps-test.XXXXXXXX.log)
   printf '\n────────────────────────────────────────────────────────────────\n'
   printf '  RKN Block Checker\n'
   printf '────────────────────────────────────────────────────────────────\n\n'
 
-  if (
-    if command -v rkn-check >/dev/null 2>&1; then
-      rkn-check
-    else
-      command -v python3 >/dev/null 2>&1 || { echo 'Не найден python3.'; exit 1; }
+  if command -v rkn-check >/dev/null 2>&1; then
+    rkn_cmd=$(command -v rkn-check)
+  else
+    command -v python3 >/dev/null 2>&1 || {
+      echo 'Не найден python3.'
+      rc=1
+    }
+    if (( rc == 0 )); then
       rm -rf -- "$venv"
-      python3 -m venv "$venv" >/dev/null 2>&1 || {
+      if ! python3 -m venv "$venv" >/dev/null 2>&1; then
         echo 'Не удалось создать временное Python-окружение.'
         echo 'Установите пакет python3-venv и повторите тест.'
-        exit 1
-      }
-      "$venv/bin/python" -m pip install --quiet --disable-pip-version-check rkn-block-checker || exit $?
-      "$venv/bin/rkn-check"
+        rc=1
+      elif ! "$venv/bin/python" -m pip install --quiet --disable-pip-version-check rkn-block-checker; then
+        rc=$?
+      else
+        rkn_cmd="$venv/bin/rkn-check"
+      fi
     fi
-  ) 2>&1 | tee "$log_file"; then
-    ps=("${PIPESTATUS[@]}")
-  else
-    ps=("${PIPESTATUS[@]}")
   fi
-  rc=${ps[0]:-1}
+
+  if (( rc == 0 )); then
+    capture_test_command "$rkn_cmd" "$log_file" || rc=$?
+  else
+    printf 'Не удалось подготовить RKN Block Checker.\n' > "$log_file"
+  fi
   rm -rf -- "$venv"
 
   printf '\n'
