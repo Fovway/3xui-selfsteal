@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.06.12
+SCRIPT_VERSION=2026.10.06.13
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -520,19 +520,19 @@ show_menu() {
   printf '%s  Версия скрипта: %s%s\n' "$dim" "$SCRIPT_VERSION" "$reset"
   printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
   printf '\n%s  НАСТРОЙКА%s\n' "$green" "$reset"
-  printf '    %s1)%s Установить / настроить self-steal\n' "$green" "$reset"
-  printf '    %s2)%s Создать новый inbound\n' "$green" "$reset"
-  printf '    %s3)%s Включить / выключить доступ к панели из интернета\n' "$green" "$reset"
+  printf '    %s1)%s 🛠️  Установить / настроить self-steal\n' "$green" "$reset"
+  printf '    %s2)%s ➕ Создать новый inbound\n' "$green" "$reset"
+  printf '    %s3)%s 🌐 Включить / выключить доступ к панели из интернета\n' "$green" "$reset"
   printf '\n%s  ПРОВЕРКА И ОБСЛУЖИВАНИЕ%s\n' "$amber" "$reset"
-  printf '    %s4)%s Проверить установку и настройки\n' "$amber" "$reset"
-  printf '    %s5)%s Исправить цепочку inbound\n' "$amber" "$reset"
-  printf '    %s6)%s Обновить скрипт с GitHub\n' "$amber" "$reset"
-  printf '    %s7)%s Тесты VPS\n' "$amber" "$reset"
+  printf '    %s4)%s ✅ Проверить установку и настройки\n' "$amber" "$reset"
+  printf '    %s5)%s 🔗 Исправить цепочку inbound\n' "$amber" "$reset"
+  printf '    %s6)%s 🔄 Обновить скрипт с GitHub\n' "$amber" "$reset"
+  printf '    %s7)%s 🧪 Тесты VPS\n' "$amber" "$reset"
   printf '\n%s  УДАЛЕНИЕ%s\n' "$red" "$reset"
-  printf '    %s8)%s Удалить всё, установленное скриптом\n' "$red" "$reset"
-  printf '    %s9)%s Удалить скрипт и команду selfsteal\n' "$red" "$reset"
+  printf '    %s8)%s 🗑️  Удалить всё, установленное скриптом\n' "$red" "$reset"
+  printf '    %s9)%s 🚮 Удалить скрипт и команду selfsteal\n' "$red" "$reset"
   printf '\n%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
-  printf '    0) Выход\n\n'
+  printf '    0) 🚪 Выход\n\n'
   while :; do
     printf '%sВыберите пункт [0–9]: %s' "$cyan" "$reset"
     read -r choice || return 1
