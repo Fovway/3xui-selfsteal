@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.06.4
+SCRIPT_VERSION=2026.10.06.5
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -17,7 +17,7 @@ ACTION='menu'
 while (( $# )); do
   case $1 in
     --help|-h) cat <<'HELP'
-Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access]
+Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access|--tests]
 Без аргументов открывается главное меню. При первом запуске меню устанавливается команда selfsteal.
 --install-script устанавливает текущую копию скрипта как /usr/local/bin/selfsteal.
 --update-script обновляет команду selfsteal из main на GitHub после проверки синтаксиса.
@@ -28,6 +28,7 @@ while (( $# )); do
 --uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
 --status показывает состояние по пунктам без изменений.
 --panel-access открывает переключатель публичного HTTPS-доступа к панели.
+--tests открывает меню внешних тестов VPS.
 --version показывает версию скрипта.
 --check выполняет предварительную проверку системы, DNS и конфликтов без изменений и запроса учетных данных.
 Недостающие утилиты предварительной проверки устанавливаются только после отдельного подтверждения.
@@ -47,6 +48,7 @@ HELP
     --repair-chain) ACTION=repair-chain; shift ;;
     --uninstall|--remove) ACTION=uninstall; shift ;;
     --panel-access) ACTION=panel-access; shift ;;
+    --tests) ACTION=vps-tests; shift ;;
     --status) ACTION=status; shift ;;
     --menu) ACTION=menu; shift ;;
     --domain) [[ $# -ge 2 ]] || { echo 'Не указан домен' >&2; exit 2; }; DOMAIN=$2; shift 2 ;;
@@ -111,6 +113,64 @@ uninstall_script_command() {
   echo 'Команда selfsteal удалена. Для повторной установки скачайте скрипт с GitHub.'
 }
 
+run_vps_test() {
+  local title=$1 command=$2 rc=0 dummy
+  printf '\n────────────────────────────────────────────────────────────────\n'
+  printf '  %s\n' "$title"
+  printf '────────────────────────────────────────────────────────────────\n'
+  printf 'Команда: %s\n\n' "$command"
+
+  if bash -lc "$command"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  printf '\n'
+  if (( rc == 0 )); then
+    echo 'Тест завершён.'
+  else
+    printf 'Тест завершился с кодом %d.\n' "$rc"
+  fi
+  read -r -p 'Нажмите Enter, чтобы вернуться к тестам...' dummy || true
+}
+
+show_vps_tests_menu() {
+  local choice cyan='' amber='' dim='' reset=''
+  if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
+    cyan=$'\033[1;36m'; amber=$'\033[1;33m'; dim=$'\033[90m'; reset=$'\033[0m'
+  fi
+
+  while :; do
+    printf '\n%s  Тесты VPS%s\n' "$cyan" "$reset"
+    printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
+    printf '    %s1)%s IP region\n' "$amber" "$reset"
+    printf '    %s2)%s Censorcheck — геоблок\n' "$amber" "$reset"
+    printf '    %s3)%s Censorcheck — DPI для серверов РФ\n' "$amber" "$reset"
+    printf '    %s4)%s Скорость до российских iPerf3 серверов\n' "$amber" "$reset"
+    printf '    %s5)%s YABS\n' "$amber" "$reset"
+    printf '    %s6)%s Блокировки зарубежными сервисами\n' "$amber" "$reset"
+    printf '    %s7)%s Параметры сервера и зарубежные speedtest\n' "$amber" "$reset"
+    printf '    %s8)%s IPQuality\n' "$amber" "$reset"
+    printf '\n    0) Назад в главное меню\n\n'
+    printf '%sВыберите тест [0–8]: %s' "$cyan" "$reset"
+    read -r choice || return 0
+
+    case "$choice" in
+      1) run_vps_test 'IP region' 'bash <(wget -qO- https://ipregion.vrnt.xyz)' ;;
+      2) run_vps_test 'Censorcheck — проверка геоблока' 'bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock' ;;
+      3) run_vps_test 'Censorcheck — DPI для серверов РФ' 'bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi' ;;
+      4) run_vps_test 'Тест до российских iPerf3 серверов' 'bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)' ;;
+      5) run_vps_test 'YABS' 'curl -sL yabs.sh | bash -s -- -4' ;;
+      6) run_vps_test 'Проверка IP сервера на блокировки зарубежными сервисами' 'bash <(curl -Ls IP.Check.Place) -l en' ;;
+      7) run_vps_test 'Параметры сервера и проверка скорости к зарубежным провайдерам' 'wget -qO- bench.sh | bash' ;;
+      8) run_vps_test 'IPQuality' 'bash <(curl -Ls https://Check.Place) -EI' ;;
+      0) exec bash "${BASH_SOURCE[0]}" --menu ;;
+      *) echo 'Введите число от 0 до 8.' ;;
+    esac
+  done
+}
+
 show_menu() {
   local choice cyan='' green='' amber='' red='' dim='' reset=''
   if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
@@ -128,13 +188,14 @@ show_menu() {
   printf '    %s4)%s Проверить установку и настройки\n' "$amber" "$reset"
   printf '    %s5)%s Исправить цепочку inbound\n' "$amber" "$reset"
   printf '    %s6)%s Обновить скрипт с GitHub\n' "$amber" "$reset"
+  printf '    %s7)%s Тесты VPS\n' "$amber" "$reset"
   printf '\n%s  УДАЛЕНИЕ%s\n' "$red" "$reset"
-  printf '    %s7)%s Удалить всё, установленное скриптом\n' "$red" "$reset"
-  printf '    %s8)%s Удалить скрипт и команду selfsteal\n' "$red" "$reset"
+  printf '    %s8)%s Удалить всё, установленное скриптом\n' "$red" "$reset"
+  printf '    %s9)%s Удалить скрипт и команду selfsteal\n' "$red" "$reset"
   printf '\n%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
   printf '    0) Выход\n\n'
   while :; do
-    printf '%sВыберите пункт [0–8]: %s' "$cyan" "$reset"
+    printf '%sВыберите пункт [0–9]: %s' "$cyan" "$reset"
     read -r choice || return 1
     case "$choice" in
       1) ACTION=install; return ;;
@@ -143,10 +204,11 @@ show_menu() {
       4) ACTION=status; return ;;
       5) ACTION=repair-chain; return ;;
       6) ACTION=update-script; return ;;
-      7) ACTION=uninstall; return ;;
-      8) ACTION=uninstall-script; return ;;
+      7) ACTION=vps-tests; return ;;
+      8) ACTION=uninstall; return ;;
+      9) ACTION=uninstall-script; return ;;
       0) exit 0 ;;
-      *) echo 'Введите число от 0 до 8.' ;;
+      *) echo 'Введите число от 0 до 9.' ;;
     esac
   done
 }
@@ -670,6 +732,7 @@ fi
 case "$ACTION" in
   uninstall-script) uninstall_script_command; exit 0 ;;
   update-script) update_script_command; exec "$SCRIPT_COMMAND" --menu ;;
+  vps-tests) show_vps_tests_menu; exit 0 ;;
   uninstall) uninstall_script ;;
   status) status_report ;;
 esac
