@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.06.7
+SCRIPT_VERSION=2026.10.06.8
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -115,7 +115,9 @@ uninstall_script_command() {
 
 ensure_screenshot_dependencies() {
   if python3 - <<'PY' >/dev/null 2>&1
+from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
+assert Path('/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf').exists()
 PY
   then
     return 0
@@ -278,7 +280,7 @@ run_rkn_block_checker() {
   printf '  RKN Block Checker\n'
   printf '────────────────────────────────────────────────────────────────\n\n'
 
-  if {
+  if (
     if command -v rkn-check >/dev/null 2>&1; then
       rkn-check
     else
@@ -292,7 +294,7 @@ run_rkn_block_checker() {
       "$venv/bin/python" -m pip install --quiet --disable-pip-version-check rkn-block-checker || exit $?
       "$venv/bin/rkn-check"
     fi
-  } 2>&1 | tee "$log_file"; then
+  ) 2>&1 | tee "$log_file"; then
     ps=("${PIPESTATUS[@]}")
   else
     ps=("${PIPESTATUS[@]}")
