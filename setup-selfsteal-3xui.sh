@@ -114,16 +114,16 @@ show_menu() {
   printf '\n%s  3x-ui self-steal by Fovway%s\n' "$cyan" "$reset"
   printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
   printf '\n%s  НАСТРОЙКА%s\n' "$green" "$reset"
-  printf '    %s1)%s Установить или настроить 3x-ui\n' "$green" "$reset"
-  printf '    %s2)%s Добавить подключение пользователю\n' "$green" "$reset"
-  printf '    %s3)%s Открыть или закрыть панель для интернета\n' "$green" "$reset"
+  printf '    %s1)%s Установить / настроить self-steal\n' "$green" "$reset"
+  printf '    %s2)%s Создать новый inbound\n' "$green" "$reset"
+  printf '    %s3)%s Включить / выключить доступ к панели из интернета\n' "$green" "$reset"
   printf '\n%s  ПРОВЕРКА И ОБСЛУЖИВАНИЕ%s\n' "$amber" "$reset"
-  printf '    %s4)%s Проверить состояние сервера\n' "$amber" "$reset"
-  printf '    %s5)%s Восстановить дополнительные подключения\n' "$amber" "$reset"
-  printf '    %s6)%s Обновить скрипт\n' "$amber" "$reset"
+  printf '    %s4)%s Проверить установку и настройки\n' "$amber" "$reset"
+  printf '    %s5)%s Исправить цепочку inbound\n' "$amber" "$reset"
+  printf '    %s6)%s Обновить скрипт с GitHub\n' "$amber" "$reset"
   printf '\n%s  УДАЛЕНИЕ%s\n' "$red" "$reset"
-  printf '    %s7)%s Удалить компоненты, установленные скриптом\n' "$red" "$reset"
-  printf '    %s8)%s Удалить скрипт (команду selfsteal)\n' "$red" "$reset"
+  printf '    %s7)%s Удалить всё, установленное скриптом\n' "$red" "$reset"
+  printf '    %s8)%s Удалить скрипт и команду selfsteal\n' "$red" "$reset"
   printf '\n%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
   printf '    0) Выход\n\n'
   while :; do
@@ -1087,10 +1087,10 @@ def publish(state):
         target.write_text(text)
 
 
-def check_panel_route(state, enabled):
+def panel_route_response(state):
     # Probe live nginx locally through its TLS/PROXY listener, without relying on DNS.
     path, _ = panel_route(state)
-    with socket.create_connection(('127.0.0.1', 9443), timeout=10) as raw:
+    with socket.create_connection(('127.0.0.1', 9443), timeout=3) as raw:
         raw.sendall(b'PROXY TCP4 127.0.0.1 127.0.0.1 12345 9443\r\n')
         with ssl.create_default_context().wrap_socket(raw, server_hostname=state['domain']) as tls:
             request = ('GET ' + path + 'csrf-token HTTP/1.1\r\nHost: ' + state['domain']
@@ -1100,15 +1100,34 @@ def check_panel_route(state, enabled):
             response.begin()
             body = response.read(1048576)
             status = response.status
-    if enabled:
+    return status, body
+
+
+def check_panel_route(state, enabled):
+    # reload signals nginx; newly started workers may not be ready immediately.
+    deadline = time.monotonic() + 15
+    last = 'нет ответа'
+    while True:
         try:
-            result = json.loads(body)
-        except (ValueError, UnicodeError):
-            result = {}
-        if status != 200 or result.get('success') is not True or not isinstance(result.get('obj'), str) or not result['obj']:
-            raise RuntimeError('Публичный HTTPS-маршрут не вернул CSRF-токен панели')
-    elif status not in (403, 404, 410):
-        raise RuntimeError('Не удалось подтвердить закрытие HTTPS-маршрута панели')
+            status, body = panel_route_response(state)
+            last = 'HTTP ' + str(status)
+            if enabled:
+                try:
+                    result = json.loads(body)
+                except (ValueError, UnicodeError):
+                    result = {}
+                if (status == 200 and isinstance(result, dict) and result.get('success') is True
+                        and isinstance(result.get('obj'), str) and result['obj']):
+                    return
+            elif status in (403, 404, 410):
+                return
+        except (OSError, http.client.HTTPException) as exc:
+            last = type(exc).__name__
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            action = 'открытие' if enabled else 'закрытие'
+            raise RuntimeError('Не удалось подтвердить ' + action + ' HTTPS-маршрута панели за 15 секунд (' + last + ')')
+        time.sleep(min(0.25, remaining))
 
 
 def panel_access(state, enabled, install_state):
@@ -1193,6 +1212,7 @@ def panel_access(state, enabled, install_state):
             subprocess.run(['systemctl', 'reload', 'nginx'], check=True)
         except Exception as rollback_error:
             raise RuntimeError('Файлы восстановлены, но nginx не перечитал прежнюю конфигурацию; проверьте nginx -t и reload. Резервная копия: ' + str(backup)) from rollback_error
+        print('Переключение отменено: прежний доступ к панели и конфигурация nginx восстановлены.', file=sys.stderr)
         raise
     state.clear(); state.update(proposed)
     print('Доступ к панели из интернета: ' + ('ВКЛЮЧЁН' if enabled else 'ВЫКЛЮЧЕН'))
