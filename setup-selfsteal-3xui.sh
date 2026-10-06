@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.06.11
+SCRIPT_VERSION=2026.10.06.12
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -365,6 +365,34 @@ after_test_menu() {
   done
 }
 
+VPS_TEST_STATUS_DIR=/root/selfsteal-3xui/test-status
+
+save_vps_test_status() {
+  local id=$1 rc=$2 status_file tmp
+  install -d -m 700 "$VPS_TEST_STATUS_DIR"
+  status_file="$VPS_TEST_STATUS_DIR/$id"
+  tmp=$(mktemp "$VPS_TEST_STATUS_DIR/.status.XXXXXXXX")
+  if (( rc == 0 )); then
+    printf 'ok\n' > "$tmp"
+  else
+    printf 'fail\n' > "$tmp"
+  fi
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$status_file"
+}
+
+print_vps_test_item() {
+  local id=$1 label=$2 amber=$3 green=$4 red=$5 reset=$6 status='' color=$amber
+  if [[ -r "$VPS_TEST_STATUS_DIR/$id" ]]; then
+    read -r status < "$VPS_TEST_STATUS_DIR/$id" || status=''
+  fi
+  case "$status" in
+    ok) color=$green ;;
+    fail) color=$red ;;
+  esac
+  printf '    %s%s)%s %s%s%s\n' "$color" "$id" "$reset" "$color" "$label" "$reset"
+}
+
 capture_test_command() {
   local command=$1 log_file=$2 quoted rc
   if command -v script >/dev/null 2>&1; then
@@ -379,7 +407,7 @@ capture_test_command() {
 }
 
 run_vps_test() {
-  local title=$1 command=$2 rc=0 log_file
+  local id=$1 title=$2 command=$3 rc=0 log_file
   log_file=$(mktemp /tmp/selfsteal-vps-test.XXXXXXXX.log)
   printf '\n────────────────────────────────────────────────────────────────\n'
   printf '  %s\n' "$title"
@@ -387,6 +415,7 @@ run_vps_test() {
   printf 'Команда: %s\n\n' "$command"
 
   capture_test_command "$command" "$log_file" || rc=$?
+  save_vps_test_status "$id" "$rc"
 
   printf '\n'
   if (( rc == 0 )); then
@@ -398,7 +427,7 @@ run_vps_test() {
 }
 
 run_rkn_block_checker() {
-  local venv=/tmp/selfsteal-rkn-checker-venv rc=0 log_file rkn_cmd
+  local venv=/tmp/selfsteal-rkn-checker-venv rc=0 log_file rkn_cmd=''
   log_file=$(mktemp /tmp/selfsteal-vps-test.XXXXXXXX.log)
   printf '\n────────────────────────────────────────────────────────────────\n'
   printf '  RKN Block Checker\n'
@@ -407,20 +436,20 @@ run_rkn_block_checker() {
   if command -v rkn-check >/dev/null 2>&1; then
     rkn_cmd=$(command -v rkn-check)
   else
-    command -v python3 >/dev/null 2>&1 || {
+    if ! command -v python3 >/dev/null 2>&1; then
       echo 'Не найден python3.'
       rc=1
-    }
+    fi
     if (( rc == 0 )); then
       rm -rf -- "$venv"
       if ! python3 -m venv "$venv" >/dev/null 2>&1; then
         echo 'Не удалось создать временное Python-окружение.'
         echo 'Установите пакет python3-venv и повторите тест.'
         rc=1
-      elif ! "$venv/bin/python" -m pip install --quiet --disable-pip-version-check rkn-block-checker; then
-        rc=$?
-      else
+      elif "$venv/bin/python" -m pip install --quiet --disable-pip-version-check rkn-block-checker; then
         rkn_cmd="$venv/bin/rkn-check"
+      else
+        rc=$?
       fi
     fi
   fi
@@ -431,6 +460,7 @@ run_rkn_block_checker() {
     printf 'Не удалось подготовить RKN Block Checker.\n' > "$log_file"
   fi
   rm -rf -- "$venv"
+  save_vps_test_status 9 "$rc"
 
   printf '\n'
   if (( rc == 0 )); then
@@ -442,36 +472,37 @@ run_rkn_block_checker() {
 }
 
 show_vps_tests_menu() {
-  local choice cyan='' amber='' dim='' reset=''
+  local choice cyan='' amber='' green='' red='' dim='' reset=''
   if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
-    cyan=$'\033[1;36m'; amber=$'\033[1;33m'; dim=$'\033[90m'; reset=$'\033[0m'
+    cyan=$'\033[1;36m'; amber=$'\033[1;33m'; green=$'\033[1;32m'
+    red=$'\033[1;31m'; dim=$'\033[90m'; reset=$'\033[0m'
   fi
 
   while :; do
     printf '\n%s  Тесты VPS%s\n' "$cyan" "$reset"
     printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
-    printf '    %s1)%s IP region\n' "$amber" "$reset"
-    printf '    %s2)%s Censorcheck — геоблок\n' "$amber" "$reset"
-    printf '    %s3)%s Censorcheck — DPI для серверов РФ\n' "$amber" "$reset"
-    printf '    %s4)%s Скорость до российских iPerf3 серверов\n' "$amber" "$reset"
-    printf '    %s5)%s YABS\n' "$amber" "$reset"
-    printf '    %s6)%s Блокировки зарубежными сервисами\n' "$amber" "$reset"
-    printf '    %s7)%s Параметры сервера и зарубежные speedtest\n' "$amber" "$reset"
-    printf '    %s8)%s IPQuality\n' "$amber" "$reset"
-    printf '    %s9)%s RKN Block Checker\n' "$amber" "$reset"
+    print_vps_test_item 1 'IP region' "$amber" "$green" "$red" "$reset"
+    print_vps_test_item 2 'Censorcheck — геоблок' "$amber" "$green" "$red" "$reset"
+    print_vps_test_item 3 'Censorcheck — DPI для серверов РФ' "$amber" "$green" "$red" "$reset"
+    print_vps_test_item 4 'Скорость до российских iPerf3 серверов' "$amber" "$green" "$red" "$reset"
+    print_vps_test_item 5 'YABS' "$amber" "$green" "$red" "$reset"
+    print_vps_test_item 6 'Блокировки зарубежными сервисами' "$amber" "$green" "$red" "$reset"
+    print_vps_test_item 7 'Параметры сервера и зарубежные speedtest' "$amber" "$green" "$red" "$reset"
+    print_vps_test_item 8 'IPQuality' "$amber" "$green" "$red" "$reset"
+    print_vps_test_item 9 'RKN Block Checker' "$amber" "$green" "$red" "$reset"
     printf '\n    0) Назад в главное меню\n\n'
     printf '%sВыберите тест [0–9]: %s' "$cyan" "$reset"
     read -r choice || return 0
 
     case "$choice" in
-      1) run_vps_test 'IP region' 'bash <(wget -qO- https://ipregion.vrnt.xyz)' ;;
-      2) run_vps_test 'Censorcheck — проверка геоблока' 'bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock' ;;
-      3) run_vps_test 'Censorcheck — DPI для серверов РФ' 'bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi' ;;
-      4) run_vps_test 'Тест до российских iPerf3 серверов' 'bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)' ;;
-      5) run_vps_test 'YABS' 'curl -sL yabs.sh | bash -s -- -4' ;;
-      6) run_vps_test 'Проверка IP сервера на блокировки зарубежными сервисами' 'bash <(curl -Ls IP.Check.Place) -l en' ;;
-      7) run_vps_test 'Параметры сервера и проверка скорости к зарубежным провайдерам' 'wget -qO- bench.sh | bash' ;;
-      8) run_vps_test 'IPQuality' 'bash <(curl -Ls https://Check.Place) -EI' ;;
+      1) run_vps_test 1 'IP region' 'bash <(wget -qO- https://ipregion.vrnt.xyz)' ;;
+      2) run_vps_test 2 'Censorcheck — проверка геоблока' 'bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock' ;;
+      3) run_vps_test 3 'Censorcheck — DPI для серверов РФ' 'bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi' ;;
+      4) run_vps_test 4 'Тест до российских iPerf3 серверов' 'bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)' ;;
+      5) run_vps_test 5 'YABS' 'curl -sL yabs.sh | bash -s -- -4' ;;
+      6) run_vps_test 6 'Проверка IP сервера на блокировки зарубежными сервисами' 'bash <(curl -Ls IP.Check.Place) -l en' ;;
+      7) run_vps_test 7 'Параметры сервера и проверка скорости к зарубежным провайдерам' 'wget -qO- bench.sh | bash' ;;
+      8) run_vps_test 8 'IPQuality' 'bash <(curl -Ls https://Check.Place) -EI' ;;
       9) run_rkn_block_checker ;;
       0) exec bash "${BASH_SOURCE[0]}" --menu ;;
       *) echo 'Введите число от 0 до 9.' ;;
