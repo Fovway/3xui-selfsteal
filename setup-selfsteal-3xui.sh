@@ -16,7 +16,7 @@ ACTION='menu'
 while (( $# )); do
   case $1 in
     --help|-h) cat <<'HELP'
-Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script]
+Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access]
 Без аргументов открывается главное меню. При первом запуске меню устанавливается команда selfsteal.
 --install-script устанавливает текущую копию скрипта как /usr/local/bin/selfsteal.
 --update-script обновляет команду selfsteal из main на GitHub после проверки синтаксиса.
@@ -26,6 +26,7 @@ while (( $# )); do
 --repair-chain связывает уже созданные скриптом inbound в цепочку 443 -> дополнительные порты -> nginx и устанавливает fingerprint firefox.
 --uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
 --status показывает состояние по пунктам без изменений.
+--panel-access открывает переключатель публичного HTTPS-доступа к панели.
 --check выполняет предварительную проверку системы, DNS и конфликтов без изменений и запроса учетных данных.
 Недостающие утилиты предварительной проверки устанавливаются только после отдельного подтверждения.
 При последующих ошибках эти пакеты сохраняются; --check ничего не устанавливает.
@@ -42,6 +43,7 @@ HELP
     --add-inbound) ACTION=add-inbound; shift ;;
     --repair-chain) ACTION=repair-chain; shift ;;
     --uninstall|--remove) ACTION=uninstall; shift ;;
+    --panel-access) ACTION=panel-access; shift ;;
     --status) ACTION=status; shift ;;
     --menu) ACTION=menu; shift ;;
     --domain) [[ $# -ge 2 ]] || { echo 'Не указан домен' >&2; exit 2; }; DOMAIN=$2; shift 2 ;;
@@ -112,30 +114,32 @@ show_menu() {
   printf '\n%s  3x-ui self-steal by Fovway%s\n' "$cyan" "$reset"
   printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
   printf '\n%s  НАСТРОЙКА%s\n' "$green" "$reset"
-  printf '    %s1)%s Установить / настроить self-steal\n' "$green" "$reset"
-  printf '    %s2)%s Добавить inbound и привязать пользователя\n' "$green" "$reset"
+  printf '    %s1)%s Установить или настроить 3x-ui\n' "$green" "$reset"
+  printf '    %s2)%s Добавить подключение пользователю\n' "$green" "$reset"
+  printf '    %s3)%s Открыть или закрыть панель для интернета\n' "$green" "$reset"
   printf '\n%s  ПРОВЕРКА И ОБСЛУЖИВАНИЕ%s\n' "$amber" "$reset"
-  printf '    %s3)%s Проверить установку и конфигурацию\n' "$amber" "$reset"
-  printf '    %s4)%s Исправить цепочку inbound\n' "$amber" "$reset"
-  printf '    %s5)%s Обновить скрипт из GitHub\n' "$amber" "$reset"
+  printf '    %s4)%s Проверить состояние сервера\n' "$amber" "$reset"
+  printf '    %s5)%s Восстановить дополнительные подключения\n' "$amber" "$reset"
+  printf '    %s6)%s Обновить скрипт\n' "$amber" "$reset"
   printf '\n%s  УДАЛЕНИЕ%s\n' "$red" "$reset"
-  printf '    %s6)%s Удалить компоненты скрипта\n' "$red" "$reset"
-  printf '    %s7)%s Удалить команду selfsteal\n' "$red" "$reset"
+  printf '    %s7)%s Удалить компоненты, установленные скриптом\n' "$red" "$reset"
+  printf '    %s8)%s Удалить скрипт (команду selfsteal)\n' "$red" "$reset"
   printf '\n%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
   printf '    0) Выход\n\n'
   while :; do
-    printf '%sВыберите пункт [0–7]: %s' "$cyan" "$reset"
+    printf '%sВыберите пункт [0–8]: %s' "$cyan" "$reset"
     read -r choice || return 1
     case "$choice" in
       1) ACTION=install; return ;;
       2) ACTION=add-inbound; return ;;
-      3) ACTION=status; return ;;
-      4) ACTION=repair-chain; return ;;
-      5) ACTION=update-script; return ;;
-      6) ACTION=uninstall; return ;;
-      7) ACTION=uninstall-script; return ;;
+      3) ACTION=panel-access; return ;;
+      4) ACTION=status; return ;;
+      5) ACTION=repair-chain; return ;;
+      6) ACTION=update-script; return ;;
+      7) ACTION=uninstall; return ;;
+      8) ACTION=uninstall-script; return ;;
       0) exit 0 ;;
-      *) echo 'Введите число от 0 до 7.' ;;
+      *) echo 'Введите число от 0 до 8.' ;;
     esac
   done
 }
@@ -718,6 +722,7 @@ import ctypes
 import ctypes.util
 import hashlib
 import http.cookiejar
+import http.client
 import ipaddress
 import json
 import os
@@ -726,6 +731,7 @@ import re
 import secrets
 import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import time
@@ -1079,6 +1085,120 @@ def publish(state):
         Path(state['panel_map']).unlink()
     if target.read_text() != text:
         target.write_text(text)
+
+
+def check_panel_route(state, enabled):
+    # Probe live nginx locally through its TLS/PROXY listener, without relying on DNS.
+    path, _ = panel_route(state)
+    with socket.create_connection(('127.0.0.1', 9443), timeout=10) as raw:
+        raw.sendall(b'PROXY TCP4 127.0.0.1 127.0.0.1 12345 9443\r\n')
+        with ssl.create_default_context().wrap_socket(raw, server_hostname=state['domain']) as tls:
+            request = ('GET ' + path + 'csrf-token HTTP/1.1\r\nHost: ' + state['domain']
+                       + '\r\nConnection: close\r\n\r\n')
+            tls.sendall(request.encode('ascii'))
+            response = http.client.HTTPResponse(tls)
+            response.begin()
+            body = response.read(1048576)
+            status = response.status
+    if enabled:
+        try:
+            result = json.loads(body)
+        except (ValueError, UnicodeError):
+            result = {}
+        if status != 200 or result.get('success') is not True or not isinstance(result.get('obj'), str) or not result['obj']:
+            raise RuntimeError('Публичный HTTPS-маршрут не вернул CSRF-токен панели')
+    elif status not in (403, 404, 410):
+        raise RuntimeError('Не удалось подтвердить закрытие HTTPS-маршрута панели')
+
+
+def panel_access(state, enabled, install_state):
+    if state.get('removed'):
+        raise RuntimeError('Установка удалена; сначала выполните установку')
+    if not state.get('domain') or not state.get('nginx_site'):
+        raise RuntimeError('Не сохранены домен или TLS-сайт установки')
+    # Read current settings; never publish a stale address or a directly exposed listener.
+    with db_read(state) as db:
+        settings = dict(db.execute('SELECT key,value FROM settings'))
+    host = settings.get('webListen', '')
+    if host not in ('127.0.0.1', '::1'):
+        raise RuntimeError('Панель слушает внешний адрес; ограничьте webListen локальным адресом в 3x-ui')
+    host_url = '[' + host + ']' if ':' in host else host
+    scheme = 'https' if settings.get('webCertFile') and settings.get('webKeyFile') else 'http'
+    path = '/' + settings.get('webBasePath', '/').strip('/') + '/'
+    panel_url = '%s://%s:%s%s' % (scheme, host_url, settings.get('webPort', '2053'), path)
+    if panel_url != state.get('panel_url'):
+        raise RuntimeError('Параметры панели изменены; повторите настройку для сохранения актуального локального URL')
+    panel_route(state)
+    proposed = copy.deepcopy(state)
+    proposed['publish_panel'] = enabled
+    plan = plan_route(proposed)
+    if not plan or proposed.get('panel_route_status') == 'existing-custom-route-preserved':
+        raise RuntimeError('Маршрут панели не принадлежит скрипту; измените пользовательский прокси вручную')
+    target, snippet, clean, _ = plan
+    # On disable, ensure another location/include will not keep this panel reachable.
+    if not enabled:
+        _, origin = panel_route(state)
+        servers = [n for n in nginx_nodes(clean) if n['words'] == ['server']
+                   and any(c['words'][0] == 'server_name' and state['domain'] in c['words'][1:]
+                           for c in n['children'] or [])]
+        def check_nodes(nodes):
+            for node in nodes:
+                words = node['words']
+                if words[0] == 'include' or (words[0] == 'proxy_pass' and (words[1].rstrip('/') == origin or words[1].startswith(origin + '/'))):
+                    raise RuntimeError('Пользовательский маршрут/include может публиковать панель; отключение требует ручной проверки')
+                check_nodes(node['children'] or [])
+        for server in servers:
+            check_nodes(server['children'] or [])
+    subprocess.run(['nginx', '-t'], check=True)
+    subprocess.run(['systemctl', 'is-active', '--quiet', 'nginx'], check=True)
+    canonical = Path(install_state)
+    access = Path(state['result_dir']) / 'access.json'
+    paths = [target, snippet, Path(state['panel_map']), access, canonical]
+    original = {}
+    for file in paths:
+        if file.is_symlink() or (file.exists() and not file.is_file()):
+            raise RuntimeError('Путь конфигурации или состояния не является обычным файлом: ' + str(file))
+        original[file] = (file.read_bytes(), file.stat().st_mode & 0o777) if file.exists() else None
+    backup = canonical.parent / 'backups' / ('panel-access-' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + secrets.token_hex(4))
+    backup.mkdir(mode=0o700, parents=True)
+    for index, (file, data) in enumerate(original.items()):
+        if data:
+            saved = backup / str(index)
+            saved.write_bytes(data[0]); os.chmod(saved, 0o600)
+    secure_json(backup / 'manifest.json', [{'path': str(file), 'exists': data is not None,
+                 'mode': data[1] if data else None} for file, data in original.items()])
+    try:
+        publish(proposed)
+        subprocess.run(['nginx', '-t'], check=True)
+        subprocess.run(['systemctl', 'reload', 'nginx'], check=True)
+        check_panel_route(proposed, enabled)
+        if not enabled:
+            proposed['panel_route_status'] = 'disabled-managed-route-removed'
+        if access.exists():
+            result = json.loads(access.read_text())
+            result.update(public_panel_enabled=enabled, public_url=proposed.get('public_url'),
+                          public_panel_status=proposed['panel_route_status'],
+                          script_exposed_public_admin=enabled)
+            secure_json(access, result)
+        proposed['panel_access_backup'] = str(backup)
+        secure_json(canonical, proposed)
+    except BaseException:
+        for file, data in original.items():
+            if data is None:
+                file.unlink(missing_ok=True)
+            else:
+                file.write_bytes(data[0]); os.chmod(file, data[1])
+        try:
+            subprocess.run(['nginx', '-t'], check=True)
+            subprocess.run(['systemctl', 'reload', 'nginx'], check=True)
+        except Exception as rollback_error:
+            raise RuntimeError('Файлы восстановлены, но nginx не перечитал прежнюю конфигурацию; проверьте nginx -t и reload. Резервная копия: ' + str(backup)) from rollback_error
+        raise
+    state.clear(); state.update(proposed)
+    print('Доступ к панели из интернета: ' + ('ВКЛЮЧЁН' if enabled else 'ВЫКЛЮЧЕН'))
+    if enabled:
+        print('URL панели: ' + state['public_url'])
+    print('Локальный доступ и SSH-туннель сохранены. Резервная копия: ' + str(backup))
 
 
 class API:
@@ -1909,7 +2029,7 @@ def verify(state):
         plan = chain_plan(api, state)
         for before, after in plan:
             if parse(before['streamSettings']) != parse(after['streamSettings']):
-                raise RuntimeError('Цепочка Reality изменена; восстановите её через пункт 4')
+                raise RuntimeError('Цепочка Reality изменена; восстановите её через пункт 5')
         wait_chain_runtime(state, plan)
     checked_uri(api, state, inbound)
     # Runtime file is the consumed bundled-Xray configuration, not just DB state.
@@ -1982,9 +2102,11 @@ def export(state):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'repair_chain', 'export', 'verify', 'rollback', 'route_preflight', 'publish'])
+    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'repair_chain', 'export', 'verify', 'rollback', 'route_preflight', 'publish', 'panel_access'])
     parser.add_argument('--state', required=True)
     parser.add_argument('--port', type=int)
+    parser.add_argument('--public', choices=['on', 'off'])
+    parser.add_argument('--install-state')
     args = parser.parse_args()
     os.umask(0o077)
     state = json.loads(Path(args.state).read_text())
@@ -1993,7 +2115,11 @@ def main():
     state.setdefault('target_port', 9443)
     save = lambda: secure_json(args.state, state)
     try:
-        if args.command == 'configure':
+        if args.command == 'panel_access':
+            if args.public is None or not args.install_state:
+                raise RuntimeError('Не указаны режим доступа или путь состояния установки')
+            panel_access(state, args.public == 'on', args.install_state)
+        elif args.command == 'configure':
             configure(state, save)
         elif args.command == 'add_inbound':
             add_inbound(state, args.port, save)
@@ -2108,6 +2234,34 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if [[ "$ACTION" == panel-access ]]; then
+  state_file=$(load_install_state || true)
+  [[ -n "$state_file" && -r "$state_file" ]] || fail 'Нет сохранённой установки. Сначала выполните установку.'
+  install -m 600 "$state_file" "$STATE"
+  echo
+  echo 'Доступ к панели из интернета'
+  python3 - "$STATE" <<'PY'
+import json,sys
+s=json.load(open(sys.argv[1]))
+if s.get('removed'): sys.exit('Установка удалена; сначала выполните установку.')
+print('Сохранённый режим: ' + ('включён' if s.get('publish_panel') else 'выключен'))
+PY
+  echo '1) Включить HTTPS-доступ по домену'
+  echo '2) Выключить доступ из интернета'
+  echo '0) Отмена'
+  read -r -p 'Выберите действие [0–2]: ' PANEL_ACCESS_CHOICE
+  case "$PANEL_ACCESS_CHOICE" in
+    1) PANEL_PUBLIC=on ;;
+    2) PANEL_PUBLIC=off ;;
+    0) exit 0 ;;
+    *) fail 'Введите 1, 2 или 0.' ;;
+  esac
+  emit_panel_helper > "$PANEL_HELPER"
+  helper panel_access --public "$PANEL_PUBLIC" --install-state /root/selfsteal-3xui/state.json
+  SUCCESS=1
+  exit 0
+fi
+
 if [[ "$ACTION" == add-inbound || "$ACTION" == repair-chain ]]; then
   echo
   echo '==============================================='
