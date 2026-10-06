@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.06.9
+SCRIPT_VERSION=2026.10.06.10
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -311,6 +311,13 @@ d.text((pad, 55), title, font=title_font, fill='#f8fafc')
 d.text((pad, 112), host, font=small, fill='#94a3b8')
 d.line((pad, 154, width-pad, 154), fill='#334155', width=2)
 
+def draw_run(draw, x, y, text, color, is_bold):
+    if not text:
+        return x
+    f = bold_font if is_bold else font
+    draw.text((x, y), text, font=f, fill=color or DEFAULT)
+    return x + draw.textlength(text, font=f)
+
 y = header_h
 for line in render_lines:
     x = pad
@@ -320,21 +327,14 @@ for line in render_lines:
     run_text = ''
     run_color = None
     run_bold = None
-    def flush():
-        nonlocal x, run_text, run_color, run_bold
-        if not run_text:
-            return
-        f = bold_font if run_bold else font
-        d.text((x, y), run_text, font=f, fill=run_color or DEFAULT)
-        x += d.textlength(run_text, font=f)
-        run_text = ''
     for ch, color, is_bold in line:
         if run_text and (color != run_color or is_bold != run_bold):
-            flush()
+            x = draw_run(d, x, y, run_text, run_color, run_bold)
+            run_text = ''
         if not run_text:
             run_color, run_bold = color, is_bold
         run_text += ch
-    flush()
+    x = draw_run(d, x, y, run_text, run_color, run_bold)
     y += line_h
 
 # Никакого брендинга self-steal/Fovway внизу изображения.
