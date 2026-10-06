@@ -4,6 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
+SCRIPT_VERSION=2026.10.06.4
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -27,6 +28,7 @@ while (( $# )); do
 --uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
 --status показывает состояние по пунктам без изменений.
 --panel-access открывает переключатель публичного HTTPS-доступа к панели.
+--version показывает версию скрипта.
 --check выполняет предварительную проверку системы, DNS и конфликтов без изменений и запроса учетных данных.
 Недостающие утилиты предварительной проверки устанавливаются только после отдельного подтверждения.
 При последующих ошибках эти пакеты сохраняются; --check ничего не устанавливает.
@@ -35,6 +37,7 @@ while (( $# )); do
 Закрытые результаты и резервные копии сохраняются в /root/selfsteal-3xui/.
 HELP
       exit 0 ;;
+    --version) printf 'selfsteal %s\n' "$SCRIPT_VERSION"; exit 0 ;;
     --check) CHECK=1; ACTION=preflight; shift ;;
     --uninstall-script) ACTION=uninstall-script; shift ;;
     --install-script) ACTION=install-script; shift ;;
@@ -79,15 +82,18 @@ install_script_command() (
 )
 
 update_script_command() (
-  local download
+  local download previous_version latest_version
   command -v curl >/dev/null || fail 'Для обновления требуется curl.'
   download=$(mktemp /tmp/selfsteal-update.XXXXXXXX)
   trap 'rm -f -- "$download"' EXIT
+  previous_version=$(sed -n 's/^SCRIPT_VERSION=//p' "$SCRIPT_COMMAND" 2>/dev/null || true)
   echo 'Загрузка последней версии скрипта из GitHub...'
-  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$SCRIPT_URL" -o "$download" || fail 'Не удалось скачать обновление; установленная команда сохранена.'
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --header 'Cache-Control: no-cache' "${SCRIPT_URL}?selfsteal_update=$(date +%s)-${RANDOM}" -o "$download" || fail 'Не удалось скачать обновление; установленная команда сохранена.'
   [[ -s "$download" ]] || fail 'GitHub вернул пустой файл; установленная команда сохранена.'
   install_script_command "$download"
-  echo 'Обновление завершено. Откройте новое меню командой selfsteal.'
+  latest_version=$(sed -n 's/^SCRIPT_VERSION=//p' "$SCRIPT_COMMAND")
+  printf 'Версия до обновления: %s\nУстановленная версия: %s\n' "${previous_version:-без номера}" "${latest_version:-без номера}"
+  echo 'Для запуска установленной версии используйте /usr/local/bin/selfsteal.'
 )
 
 uninstall_script_command() {
@@ -112,6 +118,7 @@ show_menu() {
     red=$'\033[1;31m'; dim=$'\033[90m'; reset=$'\033[0m'
   fi
   printf '\n%s  3x-ui self-steal by Fovway%s\n' "$cyan" "$reset"
+  printf '%s  Версия скрипта: %s%s\n' "$dim" "$SCRIPT_VERSION" "$reset"
   printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
   printf '\n%s  НАСТРОЙКА%s\n' "$green" "$reset"
   printf '    %s1)%s Установить / настроить self-steal\n' "$green" "$reset"
@@ -662,7 +669,7 @@ if [[ "$ACTION" == menu ]]; then
 fi
 case "$ACTION" in
   uninstall-script) uninstall_script_command; exit 0 ;;
-  update-script) update_script_command; exit 0 ;;
+  update-script) update_script_command; exec "$SCRIPT_COMMAND" --menu ;;
   uninstall) uninstall_script ;;
   status) status_report ;;
 esac
