@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.06.5
+SCRIPT_VERSION=2026.10.06.6
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -134,6 +134,43 @@ run_vps_test() {
   fi
   read -r -p 'Нажмите Enter, чтобы вернуться к тестам...' dummy || true
 }
+run_rkn_block_checker() {
+  local venv=/tmp/selfsteal-rkn-checker-venv rc=0 dummy
+  printf '\n────────────────────────────────────────────────────────────────\n'
+  printf '  RKN Block Checker\n'
+  printf '────────────────────────────────────────────────────────────────\n\n'
+
+  if command -v rkn-check >/dev/null 2>&1; then
+    rkn-check || rc=$?
+  else
+    command -v python3 >/dev/null 2>&1 || {
+      echo 'Не найден python3.'
+      rc=1
+    }
+    if (( rc == 0 )); then
+      rm -rf -- "$venv"
+      if ! python3 -m venv "$venv" >/dev/null 2>&1; then
+        echo 'Не удалось создать временное Python-окружение.'
+        echo 'Установите пакет python3-venv и повторите тест.'
+        rc=1
+      else
+        "$venv/bin/python" -m pip install --quiet --disable-pip-version-check rkn-block-checker || rc=$?
+        if (( rc == 0 )); then
+          "$venv/bin/rkn-check" || rc=$?
+        fi
+      fi
+      rm -rf -- "$venv"
+    fi
+  fi
+
+  printf '\n'
+  if (( rc == 0 )); then
+    echo 'Тест завершён.'
+  else
+    printf 'Тест завершился с кодом %d.\n' "$rc"
+  fi
+  read -r -p 'Нажмите Enter, чтобы вернуться к тестам...' dummy || true
+}
 
 show_vps_tests_menu() {
   local choice cyan='' amber='' dim='' reset=''
@@ -152,8 +189,9 @@ show_vps_tests_menu() {
     printf '    %s6)%s Блокировки зарубежными сервисами\n' "$amber" "$reset"
     printf '    %s7)%s Параметры сервера и зарубежные speedtest\n' "$amber" "$reset"
     printf '    %s8)%s IPQuality\n' "$amber" "$reset"
+    printf '    %s9)%s RKN Block Checker\n' "$amber" "$reset"
     printf '\n    0) Назад в главное меню\n\n'
-    printf '%sВыберите тест [0–8]: %s' "$cyan" "$reset"
+    printf '%sВыберите тест [0–9]: %s' "$cyan" "$reset"
     read -r choice || return 0
 
     case "$choice" in
@@ -165,8 +203,9 @@ show_vps_tests_menu() {
       6) run_vps_test 'Проверка IP сервера на блокировки зарубежными сервисами' 'bash <(curl -Ls IP.Check.Place) -l en' ;;
       7) run_vps_test 'Параметры сервера и проверка скорости к зарубежным провайдерам' 'wget -qO- bench.sh | bash' ;;
       8) run_vps_test 'IPQuality' 'bash <(curl -Ls https://Check.Place) -EI' ;;
+      9) run_rkn_block_checker ;;
       0) exec bash "${BASH_SOURCE[0]}" --menu ;;
-      *) echo 'Введите число от 0 до 8.' ;;
+      *) echo 'Введите число от 0 до 9.' ;;
     esac
   done
 }
