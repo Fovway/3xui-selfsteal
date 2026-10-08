@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.06.14
+SCRIPT_VERSION=2026.10.08.1
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -512,6 +512,106 @@ run_rkn_block_checker() {
   after_test_menu 'RKN Block Checker' "$log_file"
 }
 
+# Дополнительные тесты скорости: бинарники лежат отдельно от системных пакетов.
+# Зафиксированные SHA-256 предотвращают запуск повреждённого архива.
+prepare_speedtest_binary() {
+  local tool=$1 arch url digest name target member temp archive
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64|amd64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) echo "Неподдерживаемая архитектура для $tool: $arch" >&2; return 1 ;;
+  esac
+
+  case "$tool:$arch" in
+    ookla:amd64)
+      url='https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz'
+      digest='5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7'
+      name=speedtest ;;
+    ookla:arm64)
+      url='https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz'
+      digest='3953d231da3783e2bf8904b6dd72767c5c6e533e163d3742fd0437affa431bd3'
+      name=speedtest ;;
+    librespeed:amd64)
+      url='https://github.com/librespeed/speedtest-cli/releases/download/v1.0.14/librespeed-cli_1.0.14_linux_amd64.tar.gz'
+      digest='89800767ac14085c78a20847ebea23340f6c14a78de0a15c2ac7db8b565c961f'
+      name=librespeed-cli ;;
+    librespeed:arm64)
+      url='https://github.com/librespeed/speedtest-cli/releases/download/v1.0.14/librespeed-cli_1.0.14_linux_arm64.tar.gz'
+      digest='75e51a2494d03cb35a92ddbf862b40571a25a1526f3cf3dfa8b1d5d7bc622bd9'
+      name=librespeed-cli ;;
+    *) echo "Нет сборки $tool для $arch" >&2; return 1 ;;
+  esac
+
+  # Используем подходящий установленный бинарник, не подменяя Python speedtest-cli.
+  if [[ $tool == ookla ]] && command -v speedtest >/dev/null 2>&1 \
+    && speedtest --version 2>&1 | grep -qi 'ookla'; then
+    command -v speedtest
+    return 0
+  fi
+  if [[ $tool == librespeed ]] && command -v librespeed-cli >/dev/null 2>&1; then
+    command -v librespeed-cli
+    return 0
+  fi
+
+  target="/root/selfsteal-3xui/tools/$name"
+  if [[ -x "$target" ]]; then
+    printf '%s\n' "$target"
+    return 0
+  fi
+
+  for name in curl sha256sum tar install mktemp; do
+    command -v "$name" >/dev/null 2>&1 || {
+      echo "Для загрузки теста требуется утилита: $name" >&2
+      return 1
+    }
+  done
+  install -d -m 700 /root/selfsteal-3xui/tools || return 1
+  temp=$(mktemp -d /tmp/selfsteal-speedtest.XXXXXXXX) || return 1
+  archive="$temp/test.tar.gz"
+  echo "Загрузка $tool с официального сайта..." >&2
+  if ! curl -fSL --retry 2 --connect-timeout 15 --max-time 120 \
+      --proto '=https' --tlsv1.2 "$url" -o "$archive"; then
+    echo 'Скачать тест не удалось. Возможно, сайт недоступен с этого сервера.' >&2
+    rm -rf -- "$temp"
+    return 1
+  fi
+  if ! printf '%s  %s\n' "$digest" "$archive" | sha256sum -c - >/dev/null; then
+    echo 'SHA-256 загруженного архива не совпадает. Выполнение отменено.' >&2
+    rm -rf -- "$temp"
+    return 1
+  fi
+  if [[ $tool == ookla ]]; then
+    name=speedtest
+  else
+    name=librespeed-cli
+  fi
+  member=$(tar -tzf "$archive" | grep -E "(^|/)$name$" | head -n 1) || true
+  if [[ -z "$member" || "$member" == /* || "$member" == *..* ]]; then
+    echo "В архиве не найден исполняемый файл $name." >&2
+    rm -rf -- "$temp"
+    return 1
+  fi
+  if ! tar -xzf "$archive" -C "$temp" "$member" \
+    || ! install -m 700 "$temp/$member" "$target"; then
+    echo 'Не удалось распаковать тест скорости.' >&2
+    rm -rf -- "$temp"
+    return 1
+  fi
+  rm -rf -- "$temp"
+  printf '%s\n' "$target"
+}
+
+run_speedtest_tool() {
+  local id=$1 title=$2 tool=$3 args=$4 binary=''
+  if binary=$(prepare_speedtest_binary "$tool"); then
+    run_vps_test "$id" "$title" "$(printf '%q' "$binary") $args"
+  else
+    # Ошибка установки тоже сохраняется как красный статус теста.
+    run_vps_test "$id" "$title" "echo 'Не удалось подготовить $title. Проверьте сообщение выше.' >&2; exit 1"
+  fi
+}
+
 show_vps_tests_menu() {
   local choice cyan='' amber='' green='' red='' dim='' reset=''
   if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
@@ -531,8 +631,10 @@ show_vps_tests_menu() {
     print_vps_test_item 7 'Параметры сервера и зарубежные speedtest' "$amber" "$green" "$red" "$reset"
     print_vps_test_item 8 'IPQuality' "$amber" "$green" "$red" "$reset"
     print_vps_test_item 9 'RKN Block Checker' "$amber" "$green" "$red" "$reset"
+    print_vps_test_item 10 'Speedtest (Ookla)' "$amber" "$green" "$red" "$reset"
+    print_vps_test_item 11 'LibreSpeed (альтернативный замер)' "$amber" "$green" "$red" "$reset"
     printf '\n    0) Назад в главное меню\n\n'
-    printf '%sВыберите тест [0–9]: %s' "$cyan" "$reset"
+    printf '%sВыберите тест [0–11]: %s' "$cyan" "$reset"
     read -r choice || return 0
 
     case "$choice" in
@@ -545,8 +647,10 @@ show_vps_tests_menu() {
       7) run_vps_test 7 'Параметры сервера и проверка скорости к зарубежным провайдерам' 'wget -qO- bench.sh | bash' ;;
       8) run_vps_test 8 'IPQuality' 'bash <(curl -Ls https://Check.Place) -EI' ;;
       9) run_rkn_block_checker ;;
+      10) run_speedtest_tool 10 'Speedtest (Ookla)' ookla '' ;;
+      11) run_speedtest_tool 11 'LibreSpeed' librespeed '--simple --telemetry-level disabled' ;;
       0) exec bash "${BASH_SOURCE[0]}" --menu ;;
-      *) echo 'Введите число от 0 до 9.' ;;
+      *) echo 'Введите число от 0 до 11.' ;;
     esac
   done
 }
