@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.08.1
+SCRIPT_VERSION=2026.10.08.2
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -655,14 +655,40 @@ show_vps_tests_menu() {
   done
 }
 
+get_latest_github_script_version() {
+  # Проверка не меняет систему и не блокирует вход в меню при сетевой ошибке.
+  local latest=''
+  command -v curl >/dev/null 2>&1 || return 0
+  latest=$(curl --fail --silent --location \
+    --connect-timeout 2 --max-time 6 --proto '=https' --tlsv1.2 \
+    --header 'Cache-Control: no-cache' \
+    "${SCRIPT_URL}?version_check=$(date +%s)" 2>/dev/null \
+    | sed -n 's/^SCRIPT_VERSION=//p') || return 0
+  latest=${latest%$'\r'}
+  [[ "$latest" =~ ^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}\.[0-9]+$ ]] || return 0
+  printf '%s\n' "$latest"
+}
+
+github_version_is_newer() {
+  local latest=$1
+  [[ -n "$latest" && "$latest" != "$SCRIPT_VERSION" ]] || return 1
+  # Ubuntu/Debian: sort -V сравнивает 2026.10.08.10 как более новую, чем .9.
+  [[ "$(printf '%s\n%s\n' "$SCRIPT_VERSION" "$latest" | sort -V | tail -n 1)" == "$latest" ]]
+}
+
 show_menu() {
-  local choice cyan='' green='' amber='' red='' dim='' reset=''
+  local choice latest_version='' cyan='' green='' amber='' red='' dim='' reset=''
   if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
     cyan=$'\033[1;36m'; green=$'\033[1;32m'; amber=$'\033[1;33m'
     red=$'\033[1;31m'; dim=$'\033[90m'; reset=$'\033[0m'
   fi
+  latest_version=$(get_latest_github_script_version || true)
   printf '\n%s  3x-ui self-steal by Fovway%s\n' "$cyan" "$reset"
   printf '%s  Версия скрипта: %s%s\n' "$dim" "$SCRIPT_VERSION" "$reset"
+  if github_version_is_newer "$latest_version"; then
+    printf '\n%s  🔔 Доступна новая версия: %s (установлена: %s)%s\n' "$amber" "$latest_version" "$SCRIPT_VERSION" "$reset"
+    printf '%s     Для обновления выберите пункт 6 — «Обновить скрипт с GitHub».%s\n' "$amber" "$reset"
+  fi
   printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
   printf '\n%s  НАСТРОЙКА%s\n' "$green" "$reset"
   printf '    %s1)%s 🛠️  Установить / настроить self-steal\n' "$green" "$reset"
