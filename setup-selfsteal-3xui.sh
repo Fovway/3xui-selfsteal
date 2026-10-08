@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.08.2
+SCRIPT_VERSION=2026.10.08.3
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -676,6 +676,156 @@ github_version_is_newer() {
   [[ "$(printf '%s\n%s\n' "$SCRIPT_VERSION" "$latest" | sort -V | tail -n 1)" == "$latest" ]]
 }
 
+menu_pause() {
+  printf '\nНажмите Enter, чтобы вернуться в меню... '
+  read -r _pause_answer || true
+}
+
+show_panel_address() {
+  local state_file=''
+  state_file=$(load_install_state || true)
+  printf '\n  Адрес панели 3x-ui\n'
+  printf '────────────────────────────────────────────────────────────────\n'
+  if [[ -z "$state_file" || ! -r "$state_file" ]]; then
+    echo 'Нет сохранённой конфигурации панели Self-Steal.'
+    echo 'Если 3x-ui установлена отдельно, уточните адрес в настройках панели.'
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo 'Для чтения сохранённого адреса требуется python3.'
+    return 0
+  fi
+  python3 - "$state_file" <<'PANEL_INFO_PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        state = json.load(f)
+except (OSError, ValueError) as exc:
+    print('Не удалось прочитать настройки панели: ' + str(exc))
+    sys.exit(0)
+if state.get('removed'):
+    print('Установка Self-Steal удалена. Сохранённый адрес может быть неактуален.')
+    sys.exit(0)
+local_url = state.get('panel_url') or ''
+public_url = state.get('public_url') or ''
+enabled = state.get('publish_panel') in (True, 'true')
+print('  Локальный адрес:   ' + (local_url or 'не сохранён'))
+if enabled and public_url:
+    print('  Публичный адрес:  ' + public_url)
+else:
+    print('  Публичный доступ: выключен или не настроен')
+print('  Локальный адрес доступен с сервера или через SSH-туннель.')
+PANEL_INFO_PY
+}
+
+show_xui_status() {
+  local state=''
+  printf '\n  Состояние 3x-ui\n'
+  printf '────────────────────────────────────────────────────────────────\n'
+  if command -v systemctl >/dev/null 2>&1; then
+    state=$(systemctl is-active x-ui 2>/dev/null || true)
+    [[ -n "$state" ]] || state='не найден'
+    case "$state" in
+      active) echo '  Сервис x-ui:        работает' ;;
+      inactive) echo '  Сервис x-ui:        остановлен' ;;
+      failed) echo '  Сервис x-ui:        ошибка' ;;
+      *) printf '  Сервис x-ui:        %s\n' "$state" ;;
+    esac
+  else
+    echo '  Сервис x-ui:        systemctl недоступен'
+  fi
+  if [[ -x /usr/local/x-ui/x-ui ]]; then
+    echo '  Файл 3x-ui:        найден'
+  else
+    echo '  Файл 3x-ui:        не найден'
+  fi
+  if [[ -s /etc/x-ui/x-ui.db ]]; then
+    echo '  База данных:       найдена'
+  else
+    echo '  База данных:       не найдена'
+  fi
+  echo '  Проверка Reality и nginx: Self-Steal → Проверить конфигурацию.'
+}
+
+show_github_update_status() {
+  local latest=''
+  printf '\n  Проверка обновлений\n'
+  printf '────────────────────────────────────────────────────────────────\n'
+  printf '  Установленная версия: %s\n' "$SCRIPT_VERSION"
+  latest=$(get_latest_github_script_version || true)
+  if [[ -z "$latest" ]]; then
+    echo '  GitHub недоступен. Повторите проверку позже.'
+  elif github_version_is_newer "$latest"; then
+    printf '  🔔 Новая версия на GitHub: %s\n' "$latest"
+    echo '  Для обновления: пункт 2 этого раздела.'
+  elif [[ "$latest" == "$SCRIPT_VERSION" ]]; then
+    echo '  ✅ У вас актуальная версия.'
+  else
+    printf '  На GitHub: %s (не новее установленной)\n' "$latest"
+  fi
+}
+
+show_submenu() {
+  local section=$1 choice
+  while :; do
+    case "$section" in
+      xui)
+        printf '\n%s  🖥️ Управление 3x-ui%s\n' "$green" "$reset"
+        printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
+        printf '    1) 🔗 Показать адрес панели управления\n'
+        printf '    2) 🌐 Включить / выключить доступ к панели\n'
+        printf '    3) ✅ Проверить состояние 3x-ui\n'
+        printf '\n    0) ↩️ Назад в главное меню\n\n'
+        printf '%sВыберите пункт [0–3]: %s' "$cyan" "$reset"
+        ;;
+      selfsteal)
+        printf '\n%s  🌐 Настройка Self-Steal%s\n' "$cyan" "$reset"
+        printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
+        printf '    1) 🛠️ Установить\n'
+        printf '    2) ➕ Создать новый inbound\n'
+        printf '    3) 🔗 Исправить цепочку inbound\n'
+        printf '    4) ✅ Проверить конфигурацию\n'
+        printf '\n    0) ↩️ Назад в главное меню\n\n'
+        printf '%sВыберите пункт [0–4]: %s' "$cyan" "$reset"
+        ;;
+      service)
+        printf '\n%s  ⚙️ Обслуживание скрипта%s\n' "$amber" "$reset"
+        printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
+        printf '    1) 🔎 Проверить новую версию на GitHub\n'
+        printf '    2) 🔄 Обновить скрипт\n'
+        printf '\n    0) ↩️ Назад в главное меню\n\n'
+        printf '%sВыберите пункт [0–2]: %s' "$cyan" "$reset"
+        ;;
+      removal)
+        printf '\n%s  🗑️ Удаление%s\n' "$red" "$reset"
+        printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
+        printf '    1) 🗑️ Удалить всё, установленное скриптом\n'
+        printf '    2) 🚮 Удалить скрипт и команду selfsteal\n'
+        printf '\n    0) ↩️ Назад в главное меню\n\n'
+        printf '%sВыберите пункт [0–2]: %s' "$cyan" "$reset"
+        ;;
+      *) echo 'Неизвестный раздел меню.'; return 1 ;;
+    esac
+    read -r choice || exit 0
+    [[ "$choice" == 0 ]] && return 0
+    case "$section:$choice" in
+      xui:1) show_panel_address; menu_pause ;;
+      xui:2) ACTION=panel-access; return 0 ;;
+      xui:3) show_xui_status; menu_pause ;;
+      selfsteal:1) ACTION=install; return 0 ;;
+      selfsteal:2) ACTION=add-inbound; return 0 ;;
+      selfsteal:3) ACTION=repair-chain; return 0 ;;
+      selfsteal:4) ACTION=status; return 0 ;;
+      service:1) show_github_update_status; menu_pause ;;
+      service:2) ACTION=update-script; return 0 ;;
+      removal:1) ACTION=uninstall; return 0 ;;
+      removal:2) ACTION=uninstall-script; return 0 ;;
+      *) echo 'Такого пункта нет. Выберите номер из списка.' ;;
+    esac
+  done
+}
+
 show_menu() {
   local choice latest_version='' cyan='' green='' amber='' red='' dim='' reset=''
   if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
@@ -683,43 +833,35 @@ show_menu() {
     red=$'\033[1;31m'; dim=$'\033[90m'; reset=$'\033[0m'
   fi
   latest_version=$(get_latest_github_script_version || true)
-  printf '\n%s  3x-ui self-steal by Fovway%s\n' "$cyan" "$reset"
-  printf '%s  Версия скрипта: %s%s\n' "$dim" "$SCRIPT_VERSION" "$reset"
-  if github_version_is_newer "$latest_version"; then
-    printf '\n%s  🔔 Доступна новая версия: %s (установлена: %s)%s\n' "$amber" "$latest_version" "$SCRIPT_VERSION" "$reset"
-    printf '%s     Для обновления выберите пункт 6 — «Обновить скрипт с GitHub».%s\n' "$amber" "$reset"
-  fi
-  printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
-  printf '\n%s  НАСТРОЙКА%s\n' "$green" "$reset"
-  printf '    %s1)%s 🛠️  Установить / настроить self-steal\n' "$green" "$reset"
-  printf '    %s2)%s ➕ Создать новый inbound\n' "$green" "$reset"
-  printf '    %s3)%s 🌐 Включить / выключить доступ к панели из интернета\n' "$green" "$reset"
-  printf '\n%s  ПРОВЕРКА И ОБСЛУЖИВАНИЕ%s\n' "$amber" "$reset"
-  printf '    %s4)%s ✅ Проверить установку и настройки\n' "$amber" "$reset"
-  printf '    %s5)%s 🔗 Исправить цепочку inbound\n' "$amber" "$reset"
-  printf '    %s6)%s 🔄 Обновить скрипт с GitHub\n' "$amber" "$reset"
-  printf '    %s7)%s 🧪 Тесты VPS\n' "$amber" "$reset"
-  printf '\n%s  УДАЛЕНИЕ%s\n' "$red" "$reset"
-  printf '    %s8)%s 🗑️  Удалить всё, установленное скриптом\n' "$red" "$reset"
-  printf '    %s9)%s 🚮 Удалить скрипт и команду selfsteal\n' "$red" "$reset"
-  printf '\n%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
-  printf '    0) 🚪 Выход\n\n'
   while :; do
-    printf '%sВыберите пункт [0–9]: %s' "$cyan" "$reset"
-    read -r choice || return 1
+    printf '\n%s  3x-ui Self-Steal by Fovway%s\n' "$cyan" "$reset"
+    printf '%s  Версия скрипта: %s%s\n' "$dim" "$SCRIPT_VERSION" "$reset"
+    if github_version_is_newer "$latest_version"; then
+      printf '\n%s  🔔 Доступна новая версия: %s (установлена: %s)%s\n' "$amber" "$latest_version" "$SCRIPT_VERSION" "$reset"
+      printf '%s     Обновление: раздел 4 «Обслуживание скрипта», пункт 2.%s\n' "$amber" "$reset"
+    fi
+    printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
+    printf '    %s1)%s 🖥️ Управление 3x-ui\n' "$green" "$reset"
+    printf '    %s2)%s 🌐 Настройка Self-Steal\n' "$cyan" "$reset"
+    printf '    %s3)%s 🧪 Тесты и диагностика VPS\n' "$amber" "$reset"
+    printf '    %s4)%s ⚙️ Обслуживание скрипта\n' "$amber" "$reset"
+    printf '    %s5)%s 🗑️ Удаление\n' "$red" "$reset"
+    printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
+    printf '    0) 🚪 Выход\n\n'
+    printf '%sВыберите раздел [0–5]: %s' "$cyan" "$reset"
+    read -r choice || exit 0
     case "$choice" in
-      1) ACTION=install; return ;;
-      2) ACTION=add-inbound; return ;;
-      3) ACTION=panel-access; return ;;
-      4) ACTION=status; return ;;
-      5) ACTION=repair-chain; return ;;
-      6) ACTION=update-script; return ;;
-      7) ACTION=vps-tests; return ;;
-      8) ACTION=uninstall; return ;;
-      9) ACTION=uninstall-script; return ;;
+      1) show_submenu xui ;;
+      2) show_submenu selfsteal ;;
+      3) ACTION=vps-tests ;;
+      4) show_submenu service ;;
+      5) show_submenu removal ;;
       0) exit 0 ;;
-      *) echo 'Введите число от 0 до 9.' ;;
+      *) echo 'Введите число от 0 до 5.' ;;
     esac
+    if [[ "$ACTION" != menu ]]; then
+      return 0
+    fi
   done
 }
 
