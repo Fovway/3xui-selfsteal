@@ -15,6 +15,17 @@ class FakeHostsAPI:
         self.groups = [dict(row) for row in groups or []]
         self.operations = []
 
+    @staticmethod
+    def format_hosts(data):
+        result = []
+        for host in data['hosts']:
+            # 3x-ui parses an explicit host port instead of appending twice.
+            if host.rsplit(':', 1)[-1].isdigit():
+                result.append(host)
+            else:
+                result.append(host + ':' + str(data.get('port') or 0))
+        return result
+
     def call(self, path, data=None):
         self.operations.append((path, data))
         if path == 'panel/api/hosts/list':
@@ -22,14 +33,14 @@ class FakeHostsAPI:
         if path == 'panel/api/hosts/add':
             group_id = (data.get('groupId') or 'generated-abc')
             row = dict(data, groupId=group_id,
-                       hosts=[host + ':443' for host in data['hosts']])
+                       hosts=self.format_hosts(data))
             self.groups.append(row)
             return [{'groupId': group_id}]
         if path.startswith('panel/api/hosts/update/'):
             group_id = path.rsplit('/', 1)[1]
             self.groups = [
                 dict(data, groupId=group_id,
-                     hosts=[host + ':443' for host in data['hosts']])
+                     hosts=self.format_hosts(data))
                 if g['groupId'] == group_id else g for g in self.groups]
             return []
         if path == 'panel/api/hosts/bulk/del':
