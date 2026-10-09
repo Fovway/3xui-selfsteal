@@ -3908,12 +3908,14 @@ def parallel_restore_backup(state, api, backup, save):
     parallel_nginx()
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as check:
-                check.bind(('0.0.0.0', 443))
+        check = subprocess.run(['ss', '-H', '-ltnp', 'sport = :443'],
+                               capture_output=True, text=True, timeout=5, check=True)
+        owners = [line for line in check.stdout.splitlines() if line.strip()]
+        if owners and all('xray' in line.lower() for line in owners):
+            break  # Early-phase recovery: Xray never relinquished 443.
+        if not owners:
             break
-        except OSError:
-            time.sleep(0.2)
+        time.sleep(0.2)
     else:
         raise RuntimeError('После отката nginx не освободил TCP 443; прежний Xray не перезапускаем')
     for old in old_inbounds:
