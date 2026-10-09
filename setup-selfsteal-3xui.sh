@@ -836,6 +836,11 @@ def local_tcp_address(listen):
 def local_https_probe(ip, domain, hostname=None):
     context = ssl.create_default_context()
     context.set_alpn_protocols(['http/1.1'])
+    if hostname and hostname != domain:
+        # Unknown SNI is not a trusted hostname; test server behavior rather
+        # than failing locally on the expected certificate-name mismatch.
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
     # No DNS request to the domain: connect explicitly to the server's own IP.
     with socket.create_connection((ip, 443), timeout=4) as sock:
         sock.settimeout(4)
@@ -1502,6 +1507,34 @@ PY
   if [[ -f /etc/x-ui/x-ui.db ]]; then
     reality_out=$(python3 - "$state_file" <<'PY'
 import sqlite3,json,sys
+state=json.load(open(sys.argv[1]))
+if state.get('reality_mode') == 'parallel':
+    try:
+        db=sqlite3.connect('file:/etc/x-ui/x-ui.db?mode=ro', uri=True)
+        rows={int(r[0]):r for r in db.execute('SELECT id,protocol,port,listen,stream_settings FROM inbounds WHERE node_id IS NULL OR node_id=0')}
+        mapping=state.get('parallel_sni_by_id') or {}
+        expected=[(int(state['inbound_id']),int(state['primary_internal_port']))]
+        expected.extend((int(r['id']),int(r['port'])) for r in state.get('added_inbounds') or [])
+        if len(mapping)!=len(expected):
+            print('FAIL|Reality SNI|Сохранённый список inbound не совпадает с SNI-маршрутами')
+        else:
+            for ident,port in expected:
+                row=rows.get(ident)
+                stream=json.loads(row[4] or '{}') if row else {}
+                reality=stream.get('realitySettings') or {}
+                ok=(row and row[1]=='vless' and row[2]==port and row[3]=='127.0.0.1'
+                    and stream.get('security')=='reality'
+                    and reality.get('serverNames')==[mapping.get(str(ident))]
+                    and reality.get('target')=='127.0.0.1:9443'
+                    and stream.get('tcpSettings',{}).get('acceptProxyProtocol') is True)
+                if ok:
+                    print('OK|Reality %s|SNI %s, внутренний TCP %d, внешний TCP 443' %
+                          (ident,mapping[str(ident)],port))
+                else:
+                    print('FAIL|Reality %s|Некорректны порт, SNI, loopback или target' % ident)
+    except Exception:
+        print('FAIL|Reality SNI|Не удалось проверить входящие подключения')
+    sys.exit(0)
 try:
     db=sqlite3.connect('file:/etc/x-ui/x-ui.db?mode=ro', uri=True)
     rows=db.execute('SELECT id,protocol,port,stream_settings FROM inbounds WHERE port=443 AND (node_id IS NULL OR node_id=0)').fetchall()
