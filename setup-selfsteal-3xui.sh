@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.09.3
+SCRIPT_VERSION=2026.10.09.4
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -23,7 +23,7 @@ while (( $# )); do
 --update-script обновляет команду selfsteal из main на GitHub после проверки синтаксиса.
 --uninstall-script удаляет только команду selfsteal, сохраняя настройку сервера.
 --install запускает установку/настройку.
---add-inbound добавляет VLESS + Reality inbound, привязывает его к выбранному существующему пользователю и создаёт запись panel/hosts для сохранённого домена:443.
+--add-inbound создаёт VLESS + Reality inbound с отдельным тестовым пользователем в независимом режиме; старый режим цепочки не изменён.
 --repair-chain восстанавливает прежнюю последовательную Reality-цепочку (только для старого режима).
 28 --parallel-reality преобразует имеющуюся Reality-цепочку в независимые inbound за nginx:443 по разным SNI с автоматическим откатом.
 --uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
@@ -4075,6 +4075,47 @@ def parallel_existing_rows(state, api):
     return records
 
 
+def parallel_generate_test_client(port):
+    """Fresh, globally unique 3x-ui test identity for one newly created inbound."""
+    return dict(email='selfsteal-test-%d-%s' % (port, secrets.token_hex(6)),
+                id=str(uuid.uuid4()), subId=secrets.token_hex(12),
+                flow='xtls-rprx-vision', enable=True, limitIp=0,
+                expiryTime=0, totalGB=0, reset=0, trafficReset='never',
+                comment='Self-Steal: тестовый пользователь')
+
+
+def parallel_confirm_test_client(api, inbound_id, client):
+    snapshot = canonical_client(api, client['email'])
+    actual = snapshot.get('client') or {}
+    if (actual.get('uuid') != client['id']
+            or actual.get('subId') != client['subId']
+            or actual.get('flow') != client['flow']
+            or set(snapshot.get('inboundIds') or []) != {int(inbound_id)}):
+        raise RuntimeError('Тестовый пользователь изменён; операция отменена')
+    return snapshot
+
+
+def parallel_test_client_runtime(state, tag, port, client):
+    """Check that Xray has actually loaded the generated test UUID."""
+    path = Path(state.get('runtime_config') or str(
+        Path(state['panel_binary']).parent / 'bin/config.json'))
+    for _ in range(25):
+        try:
+            runtime = json.loads(path.read_text())
+            rows = [r for r in runtime.get('inbounds') or []
+                    if r.get('tag') == tag and int(r.get('port') or 0) == port]
+            if len(rows) == 1:
+                clients = (rows[0].get('settings') or {}).get('clients') or []
+                if any(c.get('id') == client['id']
+                       and c.get('flow') == 'xtls-rprx-vision'
+                       for c in clients):
+                    return
+        except (OSError, TypeError, ValueError, KeyError):
+            pass
+        time.sleep(1)
+    raise RuntimeError('Xray не подтвердил тестового пользователя нового Reality')
+
+
 def parallel_add_inbound(state, port, sni, save):
     if state.get('removed') or any(state.get(k) for k in (
             'pending_parallel', 'pending_add_inbound', 'pending_chain', 'pending_hysteria')):
@@ -4097,10 +4138,12 @@ def parallel_add_inbound(state, port, sni, save):
     except OSError:
         raise RuntimeError('TCP-порт занят другим процессом') from None
     parallel_dns_check(sni, state['domain'])
-    user = choose_existing_client(api)
-    email = user['client']['email']
-    uid = user['client']['uuid']
-    old_bindings = set(user.get('inboundIds') or [])
+    test_client = parallel_generate_test_client(port)
+    email = test_client['email']
+    uid = test_client['id']
+    # Never take over a pre-existing client, even if a generated name collides.
+    if any(x.get('email') == email for x in (api.call('panel/api/clients/list') or [])):
+        raise RuntimeError('Совпало имя тестового пользователя; повторите создание inbound')
     base = records[0]['before']
     stream = copy.deepcopy(parse(base['streamSettings']))
     reality = stream['realitySettings']
@@ -4132,11 +4175,14 @@ def parallel_add_inbound(state, port, sni, save):
     backup.mkdir(mode=0o700, parents=True)
     secure_json(backup / 'nginx-before.json', files)
     secure_json(backup / 'state-before.json', state)
-    secure_json(backup / 'user-before.json', user)
-    state['pending_add_inbound'] = dict(port=port, tag=tag, sni=sni, backup=str(backup))
+    secure_json(backup / 'test-client.json', test_client)
+    state['pending_add_inbound'] = dict(
+        port=port, tag=tag, sni=sni, backup=str(backup),
+        test_email=email, test_uuid=uid, test_sub_id=test_client['subId'])
     save()
     created_id = None
     host_id = None
+    test_create_attempted = False
     try:
         parallel_ensure_certs(state, projected, contents, root)
         parallel_write_file(PARALLEL_TLS, contents[PARALLEL_TLS].encode())
@@ -4147,15 +4193,18 @@ def parallel_add_inbound(state, port, sni, save):
         created_id = int(created['id'])
         state['pending_add_inbound']['id'] = created_id
         save()
-        api.call('panel/api/clients/%s/attach' % urllib.parse.quote(email, safe=''),
-                 {'inboundIds': [created_id]})
-        check_client_binding(api, user, old_bindings | {created_id})
+        # A new inbound starts with only its OWN test client. External billing
+        # services may add unlimited production clients later via 3x-ui API.
+        test_create_attempted = True
+        api.call('panel/api/clients/add', {'client': test_client, 'inboundIds': [created_id]})
+        parallel_confirm_test_client(api, created_id, test_client)
         api.restart()
         added = [x for x in api.list() if int(x['id']) == created_id]
         if len(added) != 1:
             raise RuntimeError('Панель потеряла созданный Reality inbound')
         projected[-1].update(id=created_id, before=added[0], after=added[0])
         parallel_runtime(state, projected)
+        parallel_test_client_runtime(state, tag, port, test_client)
         parallel_write_file(PARALLEL_STREAM, contents[PARALLEL_STREAM].encode())
         parallel_nginx()
         parallel_probe_443(projected)
@@ -4176,7 +4225,8 @@ def parallel_add_inbound(state, port, sni, save):
         print('Независимый Reality создан: inbound %d, SNI %s, внешний TCP 443.' %
               (created_id, sni))
         print('Внутренний порт %d доступен только с localhost.' % port)
-        print('Пользователь %s подключён. Обновите подписку клиента.' % terminal_label(email))
+        print('Тестовый пользователь %s создан только в этом inbound.' % terminal_label(email))
+        print('Остальных пользователей создавайте через API 3x-ui.')
         print('Резервная копия: ' + str(backup))
     except Exception:
         failures = []
@@ -4188,17 +4238,32 @@ def parallel_add_inbound(state, port, sni, save):
         try:
             if created_id is not None:
                 groups = api.call('panel/api/hosts/list') or []
+                # Remove only the group belonging to this operation.
                 ids = [str(g['groupId']) for g in groups
-                       if g.get('inboundIds') == [created_id] and g.get('groupId')]
+                       if g.get('inboundIds') == [created_id]
+                       and g.get('hosts') == [sni]
+                       and g.get('groupId')]
                 if ids:
                     api.call('panel/api/hosts/bulk/del', {'ids': ids})
-                actual = canonical_client(api, email)
-                if created_id in (actual.get('inboundIds') or []):
-                    api.call('panel/api/clients/%s/detach' % urllib.parse.quote(email, safe=''),
-                             {'inboundIds': [created_id]})
-                api.call('panel/api/inbounds/del/%d' % created_id, {})
+                if test_create_attempted:
+                    matches = [c for c in (api.call('panel/api/clients/list') or [])
+                               if c.get('email') == email]
+                    if len(matches) > 1:
+                        raise RuntimeError('Несколько клиентов с тестовым именем')
+                    if matches:
+                        # Fail closed if identity or attachments changed.
+                        parallel_confirm_test_client(api, created_id, test_client)
+                        api.call('panel/api/clients/del/' + urllib.parse.quote(email, safe=''), {})
+                current = [x for x in api.list() if int(x.get('id') or 0) == created_id]
+                if len(current) > 1:
+                    raise RuntimeError('Повторяется ID созданного inbound')
+                if current:
+                    # A concurrent billing integration may have added real users.
+                    # Never delete their inbound as part of automated rollback.
+                    if (parse(current[0].get('settings') or {}).get('clients') or []):
+                        raise RuntimeError('В созданном inbound есть пользователи; удаление отменено')
+                    api.call('panel/api/inbounds/del/%d' % created_id, {})
                 api.restart()
-                check_client_binding(api, user, old_bindings)
         except Exception:
             failures.append('3x-ui/Xray')
         if failures:
