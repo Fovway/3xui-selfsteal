@@ -78,7 +78,7 @@ class HysteriaTests(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def command(self,args,**kwargs):
-        if "checkhost" in args:
+        if "-checkhost" in args:
             return types.SimpleNamespace(returncode=0,stdout="Hostname example.com does match certificate\n")
         if args[0]=="ss":
             return types.SimpleNamespace(returncode=0,stdout='udp UNCONN 0 0 *:443 users:(("xray",pid=10))')
