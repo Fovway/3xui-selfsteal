@@ -62,22 +62,6 @@ class ParallelAutoTagTests(unittest.TestCase):
         self.assertFalse(helper.parallel_tag_matches(
             before, 10443, 'in-10443-tcp'))
 
-    def test_rollback_preserves_billing_clients_and_auto_tag(self):
-        live = dict(self.after, tag='in-10443-tcp',
-                    settings=json.dumps({'clients': [
-                        {'id': 'original-uuid', 'email': 'existing'},
-                        {'id': 'billing-added', 'email': 'new'}]}))
-        payload = helper.parallel_rollback_inbound(
-            self.before, live, self.after)
-        self.assertEqual(payload['port'], 443)
-        self.assertEqual(payload['tag'], 'in-10443-tcp')
-        self.assertEqual(len(json.loads(payload['settings'])['clients']), 2)
-
-    def test_rollback_fails_closed_for_foreign_renamed_tag(self):
-        live = dict(self.after, tag='malicious-renamed')
-        with self.assertRaisesRegex(RuntimeError, 'посторонний tag'):
-            helper.parallel_rollback_inbound(self.before, live, self.after)
-
 
 if __name__ == '__main__':
     unittest.main()

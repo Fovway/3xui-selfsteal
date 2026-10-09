@@ -87,7 +87,7 @@ class HostGroupRegressionTests(unittest.TestCase):
                   'mihomoIpVersion', 'finalMask'):
             self.assertEqual(row[k], prior[k], k)
 
-    def test_rollback_deletes_group_created_by_migration(self):
+    def test_rollback_deletes_new_group(self):
         api = FakeHostsAPI()
         helper.parallel_hosts_apply(api, [{'id': 1, 'sni': 'api.example.com'}], [])
         helper.parallel_hosts_restore(api, [{'id': 1}], [])

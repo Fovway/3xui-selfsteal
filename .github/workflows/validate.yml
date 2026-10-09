@@ -1,4 +1,4 @@
-name: Validate selfsteal
+name: Validate cascade
 
 on:
   push:
@@ -31,48 +31,8 @@ jobs:
           python_src=content.split("cat <<'PANEL_PY'\n",1)[1].split("\nPANEL_PY",1)[0]
           compile(python_src,'embedded_panel_helper.py','exec')
           PY
-      - name: Test test_adopt_certificate_rollback.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_adopt_certificate_rollback.py' -v
-      - name: Test test_hysteria.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_hysteria.py' -v
-      - name: Test test_masking_audit.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_masking_audit.py' -v
-      - name: Test test_panel_route.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_panel_route.py' -v
-      - name: Test test_parallel_adopt_existing.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_parallel_adopt_existing.py' -v
-      - name: Test test_parallel_adopt_isolated_tls.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_parallel_adopt_isolated_tls.py' -v
-      - name: Test test_parallel_autotag.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_parallel_autotag.py' -v
-      - name: Test test_parallel_http_bind.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_parallel_http_bind.py' -v
-      - name: Test test_parallel_host_groups.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_parallel_host_groups.py' -v
-      - name: Test test_parallel_migration_safety.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_parallel_migration_safety.py' -v
-      - name: Test test_parallel_reality.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_parallel_reality.py' -v
-      - name: Test test_parallel_runtime_listener.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_parallel_runtime_listener.py' -v
-      - name: Test test_parallel_test_client.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_parallel_test_client.py' -v
-      - name: Test test_parallel_tls_reload.py
-        if: always()
-        run: python3 -m unittest discover -s tests -p 'test_parallel_tls_reload.py' -v
+      - name: Run regression tests
+        run: python3 -m unittest discover -s tests -v
       - name: Check CLI output
         run: |
           bash setup-selfsteal-3xui.sh --version

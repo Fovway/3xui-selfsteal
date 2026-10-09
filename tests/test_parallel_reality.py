@@ -62,14 +62,6 @@ class ParallelTests(unittest.TestCase):
         self.assertEqual(after['remark'], 'original')
         self.assertTrue(after['isHidden'])
 
-    def test_duplicate_sni_is_rejected_before_api(self):
-        class NoApi:
-            def list(self):
-                raise AssertionError('should not reach API')
-        old = dict(self.state, reality_mode='chain')
-        with patch.object(helper, 'require_version'):
-            with self.assertRaisesRegex(RuntimeError, 'собственный SNI'):
-                helper.parallel_preconditions(old, {'15': 'main.example.com'}, NoApi())
 
     def test_existing_user_nginx_file_is_never_overwritten(self):
         with patch.object(helper.Path, 'is_symlink', return_value=False), patch.object(
@@ -109,10 +101,6 @@ class ParallelTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '0.0.0.0'):
                 helper.parallel_runtime(state, records, FakeApi())
 
-    def test_recovery_rejects_untrusted_backup_path(self):
-        state = {'pending_parallel': {'backup': '/tmp/user-controlled'}}
-        with self.assertRaisesRegex(RuntimeError, 'путь'):
-            helper.recover_parallel(state, lambda: None)
 
     def test_inbound_duplicate_sni_never_calls_panel(self):
         state = dict(self.state, panel_binary='/usr/local/x-ui/x-ui')
