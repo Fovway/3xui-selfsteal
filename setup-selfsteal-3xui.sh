@@ -3801,6 +3801,8 @@ def parallel_runtime(state, records):
                         and int(x.get('port') or 0) == int(r['port'])]
                 if len(rows) != 1 or rows[0].get('protocol') != 'vless':
                     raise ValueError('runtime row is missing')
+                if rows[0].get('listen') != '127.0.0.1':
+                    raise ValueError('runtime inbound is publicly bound')
                 rt = rows[0].get('streamSettings') or {}
                 configured = parse(r['after']['streamSettings'])
                 expected = configured['realitySettings']
@@ -3898,9 +3900,22 @@ def parallel_restore_backup(state, api, backup, save):
     old_inbounds = json.loads((backup / 'inbounds-before.json').read_text())
     old_groups = json.loads((backup / 'hosts-before.json').read_text())
     files = json.loads((backup / 'nginx-before.json').read_text())
+    # Restore exactly the prior nginx ownership and explicitly release 443.
+    # SIGTERM to the old nginx workers may be asynchronous after a reload.
+    # Existing Xray cannot rebind until nginx relinquishes the socket.
     # Release 443 from nginx before restarting the original Xray inbound on 443.
     parallel_restore_files(files)
     parallel_nginx()
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as check:
+                check.bind(('0.0.0.0', 443))
+            break
+        except OSError:
+            time.sleep(0.2)
+    else:
+        raise RuntimeError('После отката nginx не освободил TCP 443; прежний Xray не перезапускаем')
     for old in old_inbounds:
         api.call('panel/api/inbounds/update/%s' % old['id'], payload(old))
     api.restart()
