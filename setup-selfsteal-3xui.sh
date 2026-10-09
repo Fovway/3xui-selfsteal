@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.09.11
+SCRIPT_VERSION=2026.10.09.12
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/feature/parallel-reality-sni/setup-selfsteal-3xui.sh
@@ -3704,10 +3704,15 @@ def parallel_texts(state, records):
     acme = PARALLEL_HEADER
     for r in extras:
         name = r['sni']
+        # Adopted inbounds get an isolated loopback TLS endpoint. The original
+        # 9443 default server may reject unrecognized SNI handshakes.
+        fallback_port = int(r.get('fallback_port') or state.get('target_port', 9443))
+        if not 1024 <= fallback_port <= 65535:
+            raise RuntimeError('Некорректный внутренний TLS-порт для ' + name)
         cert = '/etc/letsencrypt/live/' + name
         tls += (
             'server {\n'
-            '    listen 127.0.0.1:9443 ssl http2 proxy_protocol;\n'
+            '    listen 127.0.0.1:' + str(fallback_port) + ' ssl http2 proxy_protocol;\n'
             '    server_name ' + name + ';\n'
             '    ssl_certificate ' + cert + '/fullchain.pem;\n'
             '    ssl_certificate_key ' + cert + '/privkey.pem;\n'
@@ -3952,9 +3957,13 @@ def parallel_assert_tls_vhosts(records):
     section = config.stdout.split(marker, 1)[1].split('\n# configuration file ', 1)[0]
     for record in records:
         name = record['sni']
+        fallback_port = int(record.get('fallback_port') or 9443)
+        listen = 'listen 127.0.0.1:%d ssl' % fallback_port
         if ('server_name ' + name + ';' not in section or
-                '/etc/letsencrypt/live/' + name + '/fullchain.pem;' not in section):
-            raise RuntimeError('Nginx не загрузил HTTPS-сертификат для ' + name)
+                '/etc/letsencrypt/live/' + name + '/fullchain.pem;' not in section
+                or listen not in section):
+            raise RuntimeError('Nginx не загрузил отдельный HTTPS/SNI listener '
+                               'для %s (127.0.0.1:%d)' % (name, fallback_port))
 
 
 def parallel_probe_fallback(records, target_port):
@@ -4369,7 +4378,14 @@ def parallel_existing_rows(state, api):
                 or row.get('listen') != '127.0.0.1'
                 or parse(row.get('streamSettings') or {}).get('realitySettings', {}).get('serverNames') != [sni]):
             raise RuntimeError('Независимый Reality изменён вне скрипта: inbound ' + str(rid))
-        records.append({'id': rid, 'sni': sni, 'port': port, 'before': row, 'after': row})
+        fallback_port = int(ref.get('fallback_port') or state.get('target_port', 9443))
+        if (ref.get('fallback_port') and
+                parse(row.get('streamSettings') or {}).get(
+                    'realitySettings', {}).get('target') !=
+                    '127.0.0.1:%d' % fallback_port):
+            raise RuntimeError('Reality inbound %d потерял сохранённый HTTPS fallback' % rid)
+        records.append({'id': rid, 'sni': sni, 'port': port,
+                        'fallback_port': fallback_port, 'before': row, 'after': row})
     if len(records) != len(mapping) or len({r['sni'] for r in records}) != len(records):
         raise RuntimeError('Состояние SNI расходится с текущим списком inbound')
     expected_files, _ = parallel_texts(state, records)
@@ -4655,6 +4671,28 @@ def parallel_adopt_plan(state, mapping, api):
     sockets = subprocess.run(['ss', '-H', '-ltnp'], capture_output=True,
                              text=True, timeout=8, check=True)
     parallel_live_listeners(sockets.stdout, planned)
+    # Keep all previously working 9443 TLS sites intact. Allocate distinct
+    # loopback listeners for adopted Reality fallbacks before touching Xray.
+    used_tls_ports = {int(state.get('target_port', 9443))}
+    for row in existing:
+        used_tls_ports.add(int(row.get('fallback_port') or
+                               state.get('target_port', 9443)))
+    for line in sockets.stdout.splitlines():
+        columns = line.split()
+        if len(columns) >= 4 and columns[0] == 'LISTEN':
+            port_text = columns[3].rsplit(':', 1)[-1]
+            if port_text.isdigit():
+                used_tls_ports.add(int(port_text))
+    for record in planned:
+        fallback_port = next((p for p in range(20000, 21000)
+                              if p not in used_tls_ports), None)
+        if fallback_port is None:
+            raise RuntimeError('Нет свободного локального TLS-порта для новых Reality')
+        used_tls_ports.add(fallback_port)
+        record['fallback_port'] = fallback_port
+        modified = parse(record['after']['streamSettings'])
+        modified['realitySettings']['target'] = '127.0.0.1:%d' % fallback_port
+        record['after']['streamSettings'] = json.dumps(modified)
     # A managed stream must be owned by this script before replacing it.
     parallel_texts(state, existing + planned)
     return existing, planned, groups
@@ -4737,7 +4775,8 @@ def parallel_adopt_existing(state, mapping, save, dry_run=False):
         parallel_write_file(PARALLEL_TLS, files[PARALLEL_TLS].encode())
         parallel_nginx()
         parallel_assert_tls_vhosts(candidates)
-        parallel_probe_fallback(candidates, int(state.get('target_port', 9443)))
+        for r in candidates:
+            parallel_probe_fallback([r], int(r['fallback_port']))
         state['pending_adopt']['stage'] = 'xray'
         save()
         for r in candidates:
@@ -4756,7 +4795,8 @@ def parallel_adopt_existing(state, mapping, save, dry_run=False):
         for r in candidates:
             state.setdefault('added_inbounds', []).append(
                 {'id': r['id'], 'port': r['port'], 'tag': r['before']['tag'],
-                 'sni': r['sni'], 'address': r['sni'], 'host_port': 443})
+                 'sni': r['sni'], 'address': r['sni'], 'host_port': 443,
+                 'fallback_port': r['fallback_port']})
             state.setdefault('parallel_sni_by_id', {})[str(r['id'])] = r['sni']
         state.pop('pending_adopt', None)
         save()
