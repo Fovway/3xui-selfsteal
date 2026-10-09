@@ -2988,8 +2988,6 @@ def add_hysteria(state, port, domain, salamander, save):
     save()
     created_id = None
     try:
-        parallel_assert_tls_vhosts(projected[1:])
-        parallel_probe_fallback([projected[-1]], int(state.get('target_port', 9443)))
         created = api.call('panel/api/inbounds/add', inbound)
         if not isinstance(created, dict) or created.get('id') is None:
             raise RuntimeError('Панель не вернула ID нового Hysteria inbound')
@@ -4493,6 +4491,8 @@ def parallel_add_inbound(state, port, sni, save):
         parallel_ensure_certs(state, projected, contents, root)
         parallel_write_file(PARALLEL_TLS, contents[PARALLEL_TLS].encode())
         parallel_nginx()
+        parallel_assert_tls_vhosts(projected[1:])
+        parallel_probe_fallback([projected[-1]], int(state.get('target_port', 9443)))
         created = api.call('panel/api/inbounds/add', inbound)
         if not isinstance(created, dict) or created.get('id') is None:
             raise RuntimeError('Панель не вернула ID нового inbound')
