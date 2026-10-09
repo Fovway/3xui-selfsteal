@@ -1227,7 +1227,7 @@ show_inbound_type_menu() {
   while :; do
     printf '\n  ➕ Создать новый inbound\n'
     printf '────────────────────────────────────────────────────────────────\n'
-    printf '    1) VLESS + Reality (TCP, существующая цепочка)\n'
+    printf '    1) VLESS + Reality (TCP, цепочка / независимый по режиму)\n'
     printf '    2) Hysteria 2 (UDP, TLS, Salamander)\n'
     printf '\n    0) ↩️ Назад\n\n'
     printf 'Выберите протокол [0–2]: '
@@ -4032,6 +4032,8 @@ def migrate_parallel(state, mapping, save):
         for r in records:
             print('Inbound ID %s: %s -> 127.0.0.1:%d' % (r['id'], r['sni'], r['port']))
         print('Ключи и пользователи сохранены. Обновите ссылки дополнительных Reality в приложениях.')
+        print('Для проверки: sudo selfsteal --status; sudo selfsteal --masking-audit')
+        print('Публичные правила UFW для старых портов скрипт НЕ удаляет.')
         print('Резервная копия: ' + str(backup))
     except Exception:
         try:
