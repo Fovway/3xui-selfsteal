@@ -4,10 +4,10 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.09.4
+SCRIPT_VERSION=2026.10.09.5
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
-SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
+SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/feature/parallel-reality-sni/setup-selfsteal-3xui.sh
 SCRIPT_MARKER='# Managed command: Fovway/3xui-selfsteal'
 # Network checks must observe this machine, not an inherited proxy.
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY
@@ -17,15 +17,16 @@ ACTION='menu'
 while (( $# )); do
   case $1 in
     --help|-h) cat <<'HELP'
-Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--parallel-reality|--recover-parallel|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access|--tests|--add-hysteria|--masking-audit]
+Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--parallel-reality|--parallel-preflight|--recover-parallel|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access|--tests|--add-hysteria|--masking-audit]
 Без аргументов открывается главное меню. При первом запуске меню устанавливается команда selfsteal.
 --install-script устанавливает текущую копию скрипта как /usr/local/bin/selfsteal.
---update-script обновляет команду selfsteal из main на GitHub после проверки синтаксиса.
+--update-script обновляет команду selfsteal из рабочей ветки feature/parallel-reality-sni после проверки синтаксиса.
 --uninstall-script удаляет только команду selfsteal, сохраняя настройку сервера.
 --install запускает установку/настройку.
 --add-inbound создаёт VLESS + Reality inbound с отдельным тестовым пользователем в независимом режиме; старый режим цепочки не изменён.
 --repair-chain восстанавливает прежнюю последовательную Reality-цепочку (только для старого режима).
-28 --parallel-reality преобразует имеющуюся Reality-цепочку в независимые inbound за nginx:443 по разным SNI с автоматическим откатом.
+--parallel-reality преобразует имеющуюся Reality-цепочку в независимые inbound за nginx:443 по разным SNI с автоматическим откатом.
+--parallel-preflight проверяет условия миграции (включая HTTPS-заглушку) без изменения nginx, Xray и панели.
 --uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
 --status показывает состояние по пунктам без изменений.
 --masking-audit проверяет маскировку Reality/TLS/HTTPS/Hysteria и закрытость панели, не изменяя конфигурацию.
@@ -51,6 +52,7 @@ HELP
     --add-hysteria) ACTION=add-hysteria; shift ;;
     --repair-chain) ACTION=repair-chain; shift ;;
     --parallel-reality) ACTION=parallel-reality; shift ;;
+    --parallel-preflight) ACTION=parallel-preflight; shift ;;
     --recover-parallel) ACTION=recover-parallel; shift ;;
     --uninstall|--remove) ACTION=uninstall; shift ;;
     --panel-access) ACTION=panel-access; shift ;;
@@ -3748,23 +3750,32 @@ def parallel_restore_files(files):
         path = Path(name)
         if not path.exists() and not entry['exists']:
             continue
-        if path.is_symlink():
-            raise RuntimeError('Путь nginx изменился на символьную ссылку: ' + name)
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise RuntimeError('Путь nginx изменился на посторонний объект: ' + name)
+        if path.is_file() and not path.read_bytes().startswith(PARALLEL_HEADER.encode()):
+            raise RuntimeError('Управляемый файл nginx изменён извне: ' + name)
         if entry['exists']:
             parallel_write_file(path, base64.b64decode(entry['content']))
             os.chmod(path, entry['mode'])
-        else:
-            if path.is_file():
-                path.unlink()
+        elif path.is_file():
+            path.unlink()
 
 
 def parallel_nginx(action='reload'):
     tested = subprocess.run(['nginx', '-t'], capture_output=True, text=True,
                             timeout=12)
     if tested.returncode:
-        raise RuntimeError('nginx -t не принял подготовленную конфигурацию')
-    subprocess.run(['systemctl', action, 'nginx'], check=True,
-                   capture_output=True, timeout=25)
+        # Nginx messages identify the invalid directive/file, not private keys.
+        # Limit to the first error line; never print the full configuration.
+        lines = [line.strip() for line in (tested.stderr or '').splitlines()
+                 if '[emerg]' in line or '[alert]' in line]
+        reason = (lines or ['nginx вернул код ' + str(tested.returncode)])[0][:300]
+        raise RuntimeError('nginx -t: ' + reason)
+    applied = subprocess.run(['systemctl', action, 'nginx'], capture_output=True,
+                             text=True, timeout=25)
+    if applied.returncode:
+        raise RuntimeError('systemctl ' + action + ' nginx завершился с кодом ' +
+                           str(applied.returncode) + '; проверьте journalctl -u nginx')
 
 
 def parallel_ensure_certs(state, records, texts, root):
@@ -3817,6 +3828,31 @@ def parallel_runtime(state, records):
         except (OSError, ValueError, KeyError, TypeError):
             time.sleep(1)
     raise RuntimeError('Xray не подтвердил работу независимых inbound')
+
+
+def parallel_probe_fallback(records, target_port):
+    """Check the actual loopback TLS fallback before taking public 443 from Xray.
+
+    The internal HTTPS listener expects the PROXY v1 header sent by REALITY
+    (xver=1), so a plain openssl s_client would give a false negative.
+    """
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    for r in records:
+        try:
+            with socket.create_connection(('127.0.0.1', target_port), timeout=6) as raw:
+                raw.settimeout(6)
+                raw.sendall(('PROXY TCP4 127.0.0.1 127.0.0.1 12345 %d\r\n'
+                             % target_port).encode('ascii'))
+                with context.wrap_socket(raw, server_hostname=r['sni']) as tls:
+                    tls.sendall(('HEAD / HTTP/1.1\r\nHost: ' + r['sni']
+                                 + '\r\nConnection: close\r\n\r\n').encode())
+                    line = tls.recv(512).split(b'\r\n', 1)[0]
+                    if not re.match(rb'^HTTP/1\.[01] [2345]\d\d', line):
+                        raise RuntimeError('Некорректный HTTP-ответ локальной HTTPS-заглушки')
+        except (OSError, ssl.SSLError) as exc:
+            raise RuntimeError('HTTPS-заглушка 127.0.0.1:%d не прошла TLS/SNI-проверку для %s (%s)' %
+                               (target_port, r['sni'], type(exc).__name__)) from None
 
 
 def parallel_probe_443(records):
@@ -3880,6 +3916,9 @@ def parallel_hosts_restore(api, records, originals):
     for r in records:
         before = parallel_host_group(api, int(r['id']), originals)
         current = parallel_host_group(api, int(r['id']), now)
+        if (before and current and before.get('groupId') == current.get('groupId')
+                and parallel_host_payload_restore(before) == parallel_host_payload_restore(current)):
+            continue  # Nothing changed in this transaction: leave subscriptions alone.
         if before and current and before.get('groupId') == current.get('groupId'):
             api.call('panel/api/hosts/update/' + str(before['groupId']),
                      parallel_host_payload_restore(before))
@@ -3895,15 +3934,52 @@ def parallel_host_payload_restore(group):
     return {key: copy.deepcopy(group[key]) for key in allowed if key in group}
 
 
+def parallel_rollback_inbound(before, current, expected=None):
+    """Undo only migration-owned fields, retaining billing-created users/UUIDs.
+
+    A 3x-ui update needs a complete inbound body. Starting from the current
+    row preserves current settings, client statistics and unrelated edits.
+    """
+    if not current or int(current.get('id') or 0) != int(before['id']):
+        raise RuntimeError('Inbound исчез во время отката; автоматический откат остановлен')
+    changed_fields = ('port', 'listen', 'streamSettings', 'shareAddrStrategy', 'shareAddr')
+    def equal(field, a, b):
+        return (parse(a) == parse(b)) if field == 'streamSettings' else (a == b)
+    if expected is not None:
+        for field in changed_fields:
+            value = current.get(field)
+            if (not equal(field, value, before.get(field))
+                    and not equal(field, value, expected.get(field))):
+                raise RuntimeError('Поле ' + field + ' inbound %s изменено извне; нужен ручной откат' %
+                                   before['id'])
+    result = copy.deepcopy(current)
+    for field in changed_fields:
+        if field in before:
+            result[field] = copy.deepcopy(before[field])
+        else:
+            result.pop(field, None)
+    return payload(result)
+
+
 def parallel_restore_backup(state, api, backup, save):
     original = json.loads((backup / 'state-before.json').read_text())
     old_inbounds = json.loads((backup / 'inbounds-before.json').read_text())
     old_groups = json.loads((backup / 'hosts-before.json').read_text())
     files = json.loads((backup / 'nginx-before.json').read_text())
-    # Restore exactly the prior nginx ownership and explicitly release 443.
-    # SIGTERM to the old nginx workers may be asynchronous after a reload.
-    # Existing Xray cannot rebind until nginx relinquishes the socket.
-    # Release 443 from nginx before restarting the original Xray inbound on 443.
+    after_path = backup / 'inbounds-after.json'
+    expected_rows = (json.loads(after_path.read_text()) if after_path.is_file() else [])
+    expected_by_id = {int(row['id']): row for row in expected_rows}
+    current_by_id = {int(row['id']): row for row in api.list()}
+    updates = []
+    for old in old_inbounds:
+        current = current_by_id.get(int(old['id']))
+        restored = parallel_rollback_inbound(
+            old, current, expected_by_id.get(int(old['id'])))
+        if any(parse(current.get(k)) != parse(restored.get(k))
+               for k in ('port', 'listen', 'streamSettings',
+                         'shareAddrStrategy', 'shareAddr')):
+            updates.append((int(old['id']), restored))
+    # Refuse external conflicts BEFORE releasing nginx/Xray sockets.
     parallel_restore_files(files)
     parallel_nginx()
     deadline = time.monotonic() + 12
@@ -3912,22 +3988,32 @@ def parallel_restore_backup(state, api, backup, save):
                                capture_output=True, text=True, timeout=5, check=True)
         owners = [line for line in check.stdout.splitlines() if line.strip()]
         if owners and all('xray' in line.lower() for line in owners):
-            break  # Early-phase recovery: Xray never relinquished 443.
+            break
         if not owners:
             break
         time.sleep(0.2)
     else:
         raise RuntimeError('После отката nginx не освободил TCP 443; прежний Xray не перезапускаем')
-    for old in old_inbounds:
-        api.call('panel/api/inbounds/update/%s' % old['id'], payload(old))
-    api.restart()
-    parallel_hosts_restore(api, [{'id': x['id']} for x in old_inbounds], old_groups)
+    for inbound_id, restored in updates:
+        api.call('panel/api/inbounds/update/%d' % inbound_id, restored)
+    # A preflight/cert issuance error must NOT restart working VPN sessions.
+    if updates:
+        api.restart()
+        live = {int(row['id']): row for row in api.list()}
+        for inbound_id, restored in updates:
+            if (inbound_id not in live or
+                    parse(live[inbound_id].get('settings')) != parse(restored.get('settings'))):
+                raise RuntimeError('Откат inbound %d изменил пользователей; требуется проверка' %
+                                   inbound_id)
+    # Only the subscriptions stage ever changes groups.
+    if state.get('pending_parallel', {}).get('stage') == 'subscriptions':
+        parallel_hosts_restore(api, [{'id': x['id']} for x in old_inbounds], old_groups)
     state.clear()
     state.update(original)
     save()
 
 
-def migrate_parallel(state, mapping, save):
+def migrate_parallel(state, mapping, save, dry_run=False):
     if state.get('pending_parallel'):
         raise RuntimeError('Есть незавершённая параллельная миграция. Сначала восстановите её.')
     api = API(state)
@@ -3976,6 +4062,15 @@ def migrate_parallel(state, mapping, save):
     for r in records[1:]:
         if parallel_host_group(api, r['id'], api.call('panel/api/hosts/list') or []) is None:
             raise RuntimeError('Не найдена группа подписки для дополнительного inbound')
+    if dry_run:
+        # No backups/files/API writes/restarts in preflight mode.
+        parallel_probe_fallback(records[:1], int(state.get('target_port', 9443)))
+        for r in records:
+            print('Готово к проверке: inbound %s, %s -> localhost:%d, сертификат: %s' %
+                  (r['id'], r['sni'], r['port'],
+                   'есть' if parallel_cert_valid(r['sni']) else 'потребуется выпуск'))
+        print('Preflight завершён без изменений конфигурации и без перезапуска Xray.')
+        return
     original = copy.deepcopy(state)
     backup = Path('/root/selfsteal-3xui/backups') / (
         'parallel-' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-'
@@ -3985,6 +4080,7 @@ def migrate_parallel(state, mapping, save):
     groups = api.call('panel/api/hosts/list') or []
     secure_json(backup / 'state-before.json', original)
     secure_json(backup / 'inbounds-before.json', [r['before'] for r in records])
+    secure_json(backup / 'inbounds-after.json', [r['after'] for r in records])
     secure_json(backup / 'hosts-before.json', groups)
     secure_json(backup / 'nginx-before.json', files)
     with db_read(state) as read_db, sqlite3.connect(backup / 'panel-before.db') as dest:
@@ -3995,8 +4091,12 @@ def migrate_parallel(state, mapping, save):
     try:
         parallel_ensure_certs(state, records, texts, root)
         parallel_write_file(PARALLEL_TLS, texts[PARALLEL_TLS].encode())
-        # Validate the new TLS vhosts before moving the public port.
+        # Validate the new TLS vhosts and PROXY-protocol fallback while
+        # existing Xray still owns external TCP 443.
         parallel_nginx()
+        state['pending_parallel']['stage'] = 'fallback-check'
+        save()
+        parallel_probe_fallback(records, int(state.get('target_port', 9443)))
         state['pending_parallel']['stage'] = 'xray'
         save()
         for r in records:
@@ -4035,16 +4135,30 @@ def migrate_parallel(state, mapping, save):
         print('Для проверки: sudo selfsteal --status; sudo selfsteal --masking-audit')
         print('Публичные правила UFW для старых портов скрипт НЕ удаляет.')
         print('Резервная копия: ' + str(backup))
-    except Exception:
+    except Exception as exc:
+        stage = state.get('pending_parallel', {}).get('stage', 'unknown')
+        detail = (str(exc).replace('\\n', ' ').strip()[:300]
+                  if isinstance(exc, RuntimeError) else type(exc).__name__)
+        try:
+            secure_json(backup / 'migration-failure.json',
+                        {'stage': stage, 'error_type': type(exc).__name__,
+                         'reason': detail})
+        except OSError:
+            pass  # Never let diagnostic I/O prevent rollback.
         try:
             parallel_restore_backup(state, api, backup, save)
-        except Exception:
+        except Exception as rollback_exc:
             state['pending_parallel'] = {'backup': str(backup),
-                                         'rollback_incomplete': True}
+                                         'rollback_incomplete': True,
+                                         'failed_stage': stage}
             save()
-            raise RuntimeError('Миграция не завершена и автоматический откат требует проверки. '
-                               'Резервная копия: ' + str(backup)) from None
-        raise RuntimeError('Миграция отменена; восстановлены прежние конфигурации nginx, Xray и hosts') from None
+            raise RuntimeError('Миграция: ' + stage + ': ' + detail +
+                               '; откат требует проверки (' +
+                               type(rollback_exc).__name__ + '). Копия: ' +
+                               str(backup)) from None
+        raise RuntimeError('Миграция: ' + stage + ': ' + detail +
+                           '; прежние настройки восстановлены. Отчёт: ' +
+                           str(backup / 'migration-failure.json')) from None
 
 
 
@@ -4289,7 +4403,7 @@ def recover_parallel(state, save):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'add_hysteria', 'repair_chain', 'export', 'verify', 'rollback', 'route_preflight', 'publish', 'panel_access', 'migrate_parallel', 'recover_parallel'])
+    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'add_hysteria', 'repair_chain', 'export', 'verify', 'rollback', 'route_preflight', 'publish', 'panel_access', 'migrate_parallel', 'parallel_preflight', 'recover_parallel'])
     parser.add_argument('--state', required=True)
     parser.add_argument('--port', type=int)
     parser.add_argument('--domain')
@@ -4321,13 +4435,13 @@ def main():
             if args.public is None or not args.install_state:
                 raise RuntimeError('Не указаны режим доступа или путь состояния установки')
             panel_access(state, args.public == 'on', args.install_state)
-        elif args.command == 'migrate_parallel':
+        elif args.command in ('migrate_parallel', 'parallel_preflight'):
             if not args.sni_map:
                 raise RuntimeError('Для миграции нужен файл сопоставления SNI')
             mapping = json.loads(Path(args.sni_map).read_text())
             if not isinstance(mapping, dict):
                 raise RuntimeError('Ожидается JSON словарь ID → SNI')
-            migrate_parallel(state, mapping, save)
+            migrate_parallel(state, mapping, save, dry_run=args.command == 'parallel_preflight')
         elif args.command == 'recover_parallel':
             recover_parallel(state, save)
         elif args.command == 'configure':
@@ -4340,7 +4454,8 @@ def main():
             repair_chain(state, save)
         else:
             globals()[args.command](state)
-        save()
+        if args.command != 'parallel_preflight':
+            save()
     except Exception as exc:
         save()
         print('Помощник панели: ' + str(exc), file=sys.stderr)
@@ -4475,7 +4590,7 @@ PY
   exit 0
 fi
 
-if [[ "$ACTION" == add-inbound || "$ACTION" == add-hysteria || "$ACTION" == repair-chain || "$ACTION" == parallel-reality || "$ACTION" == recover-parallel ]]; then
+if [[ "$ACTION" == add-inbound || "$ACTION" == add-hysteria || "$ACTION" == repair-chain || "$ACTION" == parallel-reality || "$ACTION" == parallel-preflight || "$ACTION" == recover-parallel ]]; then
   echo
   echo '==============================================='
   echo '        3xUI Self-Steal — создание inbound'
@@ -4488,8 +4603,9 @@ if [[ "$ACTION" == add-inbound || "$ACTION" == add-hysteria || "$ACTION" == repa
   HYSTERIA_DOMAIN=''
   HYSTERIA_SALAMANDER=on
   PARALLEL_MAP=''
-  if [[ "$ACTION" == parallel-reality || "$ACTION" == recover-parallel ]]; then
+  if [[ "$ACTION" == parallel-reality || "$ACTION" == parallel-preflight || "$ACTION" == recover-parallel ]]; then
     PANEL_ACTION=migrate_parallel
+    [[ "$ACTION" != parallel-preflight ]] || PANEL_ACTION=parallel_preflight
     if [[ "$ACTION" == recover-parallel ]]; then
       PANEL_ACTION=recover_parallel
       echo 'Будет восстановлена конфигурация до незавершённой миграции.'
@@ -4498,8 +4614,12 @@ if [[ "$ACTION" == add-inbound || "$ACTION" == add-hysteria || "$ACTION" == repa
     else
       echo 'Независимые Reality на TCP 443: каждый дополнительный inbound получит отдельный SNI.'
       echo 'Основной домен сохраняется. Клиентам дополнительных inbound потребуется обновить ссылку.'
-      read -r -p 'Подготовить безопасную миграцию? [y/N]: ' PARALLEL_OK
-      [[ "${PARALLEL_OK,,}" == y ]] || exit 0
+      if [[ "$ACTION" == parallel-reality ]]; then
+        read -r -p 'Подготовить безопасную миграцию? [y/N]: ' PARALLEL_OK
+        [[ "${PARALLEL_OK,,}" == y ]] || exit 0
+      else
+        echo 'Только предварительные проверки: nginx, Xray и подписки останутся без изменений.'
+      fi
       PARALLEL_MAP=$(mktemp /tmp/selfsteal-sni.XXXXXXXX)
       chmod 600 "$PARALLEL_MAP"
       python3 - "$state_file" "$PARALLEL_MAP" <<'PY'
@@ -4513,8 +4633,10 @@ for row in state.get('added_inbounds') or []:
     m[ident]=input('  Уникальный домен/SNI (DNS на тот же сервер): ').strip()
 with open(sys.argv[2],'w') as f: json.dump(m,f)
 PY
-      read -r -p 'Для изменения работающего nginx и Xray введите PARALLEL REALITY: ' PARALLEL_CONFIRM
-      [[ "$PARALLEL_CONFIRM" == 'PARALLEL REALITY' ]] || { rm -f "$PARALLEL_MAP"; exit 0; }
+      if [[ "$ACTION" == parallel-reality ]]; then
+        read -r -p 'Для изменения работающего nginx и Xray введите PARALLEL REALITY: ' PARALLEL_CONFIRM
+        [[ "$PARALLEL_CONFIRM" == 'PARALLEL REALITY' ]] || { rm -f "$PARALLEL_MAP"; exit 0; }
+      fi
       HELPER_ARGS=(--sni-map "$PARALLEL_MAP")
     fi
   fi
@@ -4581,6 +4703,7 @@ PY
   fi
   if helper "$PANEL_ACTION" "${HELPER_ARGS[@]}"; then
     [[ -z "$PARALLEL_MAP" ]] || rm -f "$PARALLEL_MAP"
+    if [[ "$ACTION" == parallel-preflight ]]; then SUCCESS=1; exit 0; fi
     persist_tmp="/root/selfsteal-3xui/state.json.tmp.$$"
     install -m 600 "$STATE" "$persist_tmp"
     mv -f -- "$persist_tmp" /root/selfsteal-3xui/state.json
