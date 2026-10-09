@@ -1,0 +1,39 @@
+name: Validate selfsteal
+
+on:
+  push:
+    paths:
+      - 'setup-selfsteal-3xui.sh'
+      - 'tests/**'
+      - '.github/workflows/validate.yml'
+  pull_request:
+    paths:
+      - 'setup-selfsteal-3xui.sh'
+      - 'tests/**'
+      - '.github/workflows/validate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: bash -n setup-selfsteal-3xui.sh
+      - name: Check embedded Python syntax
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          content=Path('setup-selfsteal-3xui.sh').read_text()
+          python_src=content.split("cat <<'PANEL_PY'\n",1)[1].split("\nPANEL_PY",1)[0]
+          compile(python_src,'embedded_panel_helper.py','exec')
+          PY
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Check CLI output
+        run: |
+          bash setup-selfsteal-3xui.sh --version
+          bash setup-selfsteal-3xui.sh --help > /dev/null
