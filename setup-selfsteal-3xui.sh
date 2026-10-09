@@ -1031,6 +1031,8 @@ import sqlite3,json,sys
 try:
     db=sqlite3.connect('file:/etc/x-ui/x-ui.db?mode=ro', uri=True)
     rows=db.execute('SELECT id,protocol,port,stream_settings FROM inbounds WHERE port=443 AND (node_id IS NULL OR node_id=0)').fetchall()
+    rows=[row for row in rows if row[1] not in ('hysteria','tuic','wireguard','amneziawg')
+          and json.loads(row[3] or '{}').get('network') not in ('hysteria','kcp','quic')]
     if not rows:
         print('WARN|Reality inbound|на локальном порту 443 не найден')
     elif len(rows)>1:
@@ -1519,6 +1521,8 @@ def inspect(state):
             db.row_factory = sqlite3.Row
             inbounds = [dict(r) for r in db.execute('SELECT * FROM inbounds WHERE port=443 AND (node_id IS NULL OR node_id=0)')]
         for row in inbounds:
+            if inbound_uses_udp(row):
+                continue
             stream = parse(row['stream_settings'])
             if row['protocol'] != 'vless' or stream.get('security') != 'reality':
                 raise RuntimeError('Существующее локальное входящее подключение панели на порту 443 несовместимо; изменений нет')
@@ -1997,7 +2001,8 @@ def public_key(private):
 
 
 def pick(inbounds):
-    matches = [i for i in inbounds if i.get('port') == 443 and not i.get('nodeId')]
+    matches = [i for i in inbounds if int(i.get('port') or 0) == 443 and not i.get('nodeId')
+               and not inbound_uses_udp(i)]
     if len(matches) > 1:
         raise RuntimeError('Несколько локальных входящих подключений на порту 443 не поддерживаются')
     if matches and (matches[0]['protocol'] != 'vless' or parse(matches[0]['streamSettings']).get('security') != 'reality'):
@@ -2374,6 +2379,196 @@ def repair_chain(state, save):
     print('Ключи, пользователи и panel/hosts сохранены. Обновите подписку в приложении.')
 
 
+def inbound_uses_udp(row):
+    protocol = str(row.get('protocol') or '').lower()
+    if protocol in ('hysteria', 'tuic', 'wireguard', 'amneziawg'):
+        return True
+    stream = parse(row.get('streamSettings') or row.get('stream_settings') or {})
+    return stream.get('network') in ('hysteria', 'kcp', 'quic')
+
+
+def add_hysteria(state, port, domain, salamander, save):
+    # Independent UDP Hysteria 2: it never changes the Reality TCP chain.
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise RuntimeError('Порт должен быть от 1 до 65535')
+    if (not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', domain)
+            or len(domain) > 253):
+        raise RuntimeError('Некорректный домен: нужен ASCII/Punycode')
+    if state.get('removed') or any(state.get(k) for k in ('pending_hysteria', 'pending_add_inbound', 'pending_chain')):
+        raise RuntimeError('Установка удалена или есть незавершённая операция')
+    if not all(state.get(k) for k in ('domain', 'panel_url', 'panel_username', 'panel_password', 'inbound_id')):
+        raise RuntimeError('Сначала установите и настройте Self-Steal')
+    cert = Path('/etc/letsencrypt/live') / domain / 'fullchain.pem'
+    key = Path('/etc/letsencrypt/live') / domain / 'privkey.pem'
+    if not cert.is_file() or not key.is_file():
+        raise RuntimeError('Не найден сертификат Let's Encrypt для ' + domain + '. Выпустите его через certbot.')
+    checks = (
+        (['openssl', 'x509', '-in', str(cert), '-noout', '-checkend', '3600'], None),
+        (['openssl', 'x509', '-in', str(cert), '-noout', '-checkhost', domain], 'does match certificate'),
+        (['openssl', 'pkey', '-in', str(key), '-noout'], None),
+    )
+    for cmd, required in checks:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        except (OSError, subprocess.TimeoutExpired):
+            raise RuntimeError('Не удалось проверить TLS-сертификат или ключ') from None
+        if result.returncode or (required and required not in result.stdout):
+            raise RuntimeError('Сертификат не подходит для домена, истёк или ключ недоступен')
+
+    # Verify the existing Reality configuration before changing the panel.
+    api, _ = verify(state)
+    if any(not row.get('nodeId') and int(row.get('port') or 0) == port
+           and inbound_uses_udp(row) for row in api.list()):
+        raise RuntimeError('UDP-порт уже назначен существующему inbound')
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.bind(('0.0.0.0', port))
+    except OSError:
+        raise RuntimeError('UDP-порт занят другим процессом') from None
+    finally:
+        probe.close()
+
+    auth = secrets.token_hex(24)
+    obfs_password = secrets.token_urlsafe(24) if salamander else ''
+    email = 'selfsteal-hy-' + secrets.token_hex(6)
+    tag = 'selfsteal-hysteria-%d-%s' % (port, secrets.token_hex(4))
+    settings = {'version': 2, 'clients': [{
+        'auth': auth, 'email': email, 'limitIp': 0, 'totalGB': 0, 'expiryTime': 0,
+        'enable': True, 'tgId': 0, 'subId': secrets.token_hex(8), 'comment': '', 'reset': 0,
+    }]}
+    stream = {
+        'network': 'hysteria', 'hysteriaSettings': {'version': 2, 'udpIdleTimeout': 60},
+        'security': 'tls', 'tlsSettings': {
+            'serverName': domain, 'minVersion': '1.2', 'maxVersion': '1.3',
+            'rejectUnknownSni': False, 'alpn': ['h3'],
+            'certificates': [{
+                'certificateFile': str(cert), 'keyFile': str(key),
+                'usage': 'encipherment', 'oneTimeLoading': False, 'buildChain': False,
+                'useFile': True,
+            }],
+        },
+    }
+    if salamander:
+        stream['finalmask'] = {'udp': [{'type': 'salamander',
+                                       'settings': {'password': obfs_password}}]}
+    inbound = {
+        'remark': 'selfsteal-hysteria-%d' % port, 'enable': True, 'expiryTime': 0,
+        'total': 0, 'up': 0, 'down': 0, 'port': port,
+        'protocol': 'hysteria', 'listen': '0.0.0.0',
+        'tag': tag, 'trafficReset': 'never', 'trafficResetDay': 1,
+        'sniffing': json.dumps({'enabled': False}), 'settings': json.dumps(settings),
+        'streamSettings': json.dumps(stream), 'shareAddrStrategy': 'custom',
+        'shareAddr': domain, 'disableFlow': False,
+    }
+    state['pending_hysteria'] = {'port': port, 'tag': tag, 'domain': domain}
+    save()
+    created_id = None
+    try:
+        created = api.call('panel/api/inbounds/add', inbound)
+        if not isinstance(created, dict) or created.get('id') is None:
+            raise RuntimeError('Панель не вернула ID нового Hysteria inbound')
+        created_id = int(created['id'])
+        state['pending_hysteria']['id'] = created_id
+        save()
+        stored = [r for r in api.list() if r.get('tag') == tag and int(r.get('port') or 0) == port]
+        if len(stored) != 1 or int(stored[0]['id']) != created_id or stored[0]['protocol'] != 'hysteria':
+            raise RuntimeError('API панели не подтвердил созданный Hysteria inbound')
+        actual_settings = parse(stored[0].get('settings') or {})
+        actual_stream = parse(stored[0].get('streamSettings') or {})
+        actual_clients = actual_settings.get('clients') or []
+        actual_masks = (actual_stream.get('finalmask') or {}).get('udp') or []
+        if (actual_settings.get('version') != 2
+                or not any(c.get('auth') == auth and c.get('email') == email for c in actual_clients)
+                or actual_stream.get('network') != 'hysteria'
+                or actual_stream.get('security') != 'tls'
+                or (salamander and not any(m.get('type') == 'salamander'
+                    and m.get('settings', {}).get('password') == obfs_password
+                    for m in actual_masks))):
+            raise RuntimeError('Панель изменила параметры Hysteria: операция отменена')
+
+        api.restart()
+        runtime_path = Path(state.get('runtime_config') or str(
+            Path(state['panel_binary']).parent / 'bin/config.json'))
+        verified = False
+        for _ in range(25):
+            try:
+                runtime = json.loads(runtime_path.read_text())
+                live = [r for r in runtime.get('inbounds', [])
+                        if r.get('tag') == tag and r.get('protocol') == 'hysteria'
+                        and int(r.get('port') or 0) == port]
+                if len(live) == 1:
+                    rt_stream = live[0].get('streamSettings') or {}
+                    rt_settings = live[0].get('settings') or {}
+                    rt_clients = rt_settings.get('clients') or rt_settings.get('users') or []
+                    rt_masks = (rt_stream.get('finalmask') or {}).get('udp') or []
+                    verified = (
+                        rt_stream.get('network') == 'hysteria'
+                        and rt_stream.get('security') == 'tls'
+                        and any(c.get('auth') == auth for c in rt_clients)
+                        and (not salamander or any(m.get('type') == 'salamander'
+                            and m.get('settings', {}).get('password') == obfs_password
+                            for m in rt_masks)))
+                if verified:
+                    listener = subprocess.run(['ss', '-H', '-lunp', 'sport = :%d' % port],
+                                              capture_output=True, text=True, timeout=3)
+                    verified = listener.returncode == 0 and 'xray' in listener.stdout.lower()
+            except (OSError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired):
+                verified = False
+            if verified:
+                break
+            time.sleep(1)
+        if not verified:
+            raise RuntimeError('Xray не подтвердил запуск Hysteria 2 и прослушивание UDP')
+
+        uri = 'hysteria2://%s@%s:%d/?sni=%s&insecure=0' % (
+            urllib.parse.quote(auth, safe=''), domain, port,
+            urllib.parse.quote(domain, safe=''))
+        if salamander:
+            uri += '&obfs=salamander&obfs-password=' + urllib.parse.quote(obfs_password, safe='')
+        uri += '#' + urllib.parse.quote('selfsteal-hysteria-%d' % port, safe='')
+        folder = Path('/root/selfsteal-3xui/hysteria')
+        folder.mkdir(parents=True, mode=0o700, exist_ok=True)
+        credential_file = folder / ('inbound-%d-%d.json' % (port, created_id))
+        secure_json(credential_file, {'id': created_id, 'domain': domain, 'port': port,
+                                      'email': email, 'auth': auth,
+                                      'salamander_password': obfs_password, 'uri': uri})
+        state.setdefault('hysteria_inbounds', []).append({
+            'id': created_id, 'port': port, 'tag': tag,
+            'domain': domain, 'credential_file': str(credential_file),
+        })
+        state.pop('pending_hysteria', None)
+        save()
+        print('Hysteria 2 создана: inbound ID %d, UDP %d, TLS %s.' % (created_id, port, domain))
+        print('Salamander: ' + ('включён' if salamander else 'выключен'))
+        print('Ссылка клиента: ' + uri)
+        print('Закрытая копия реквизитов: ' + str(credential_file))
+        print('TCP Reality и его цепочка не изменены.')
+        print('Проверьте доступность UDP %d в UFW и файрволе провайдера.' % port)
+    except Exception:
+        failures = []
+        try:
+            owned = [r for r in api.list()
+                     if r.get('tag') == tag and r.get('protocol') == 'hysteria'
+                     and int(r.get('port') or 0) == port]
+            if len(owned) > 1:
+                raise RuntimeError('Обнаружены дубликаты нового inbound')
+            for row in owned:
+                api.call('panel/api/inbounds/del/%s' % int(row['id']), {})
+            if owned or created_id is not None:
+                api.restart()
+            if any(r.get('tag') == tag for r in api.list()):
+                raise RuntimeError('Не удалось подтвердить удаление')
+        except Exception:
+            failures.append('inbound/Xray')
+        if failures:
+            state['pending_hysteria']['rollback_incomplete'] = failures
+            save()
+            raise RuntimeError('Откат Hysteria не завершён. Проверьте записи в 3x-ui.') from None
+        state.pop('pending_hysteria', None)
+        save()
+        raise
+
+
 def add_inbound(state, port, save):
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise RuntimeError('Порт должен быть целым числом от 1 до 65535')
@@ -2391,7 +2586,8 @@ def add_inbound(state, port, save):
     # before adding anything. This protects unrelated or incomplete panel setups.
     api, _ = verify(state)
     inbounds = api.list()
-    if any(not item.get('nodeId') and int(item.get('port') or 0) == port for item in inbounds):
+    if any(not item.get('nodeId') and int(item.get('port') or 0) == port
+           and not inbound_uses_udp(item) for item in inbounds):
         raise RuntimeError('Этот TCP-порт уже назначен существующему inbound')
     if any(item.get('tag') == 'selfsteal-reality-%d' % port for item in inbounds):
         raise RuntimeError('Inbound с таким служебным тегом уже существует')
@@ -2844,9 +3040,11 @@ def export(state):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'repair_chain', 'export', 'verify', 'rollback', 'route_preflight', 'publish', 'panel_access'])
+    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'add_hysteria', 'repair_chain', 'export', 'verify', 'rollback', 'route_preflight', 'publish', 'panel_access'])
     parser.add_argument('--state', required=True)
     parser.add_argument('--port', type=int)
+    parser.add_argument('--domain')
+    parser.add_argument('--salamander', choices=['on', 'off'], default='on')
     parser.add_argument('--public', choices=['on', 'off'])
     parser.add_argument('--install-state')
     args = parser.parse_args()
@@ -2865,6 +3063,8 @@ def main():
             configure(state, save)
         elif args.command == 'add_inbound':
             add_inbound(state, args.port, save)
+        elif args.command == 'add_hysteria':
+            add_hysteria(state, args.port, args.domain or state.get('domain', ''), args.salamander == 'on', save)
         elif args.command == 'repair_chain':
             repair_chain(state, save)
         else:
