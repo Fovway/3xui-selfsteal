@@ -4220,7 +4220,18 @@ def main():
     state.setdefault('panel_binary', '/usr/local/x-ui/x-ui')
     state.setdefault('panel_db', '/etc/x-ui/x-ui.db')
     state.setdefault('target_port', 9443)
-    save = lambda: secure_json(args.state, state)
+    # Parallel cutovers can outlive an SSH connection. Save each stage in the
+    # canonical state file as well as the scratch copy so --recover-parallel
+    # can find the rollback journal even after SIGKILL or a power failure.
+    checkpoint = (args.command in ('migrate_parallel', 'recover_parallel')
+                  or (args.command == 'add_inbound'
+                      and state.get('reality_mode') == 'parallel'))
+    if checkpoint and not args.install_state:
+        raise RuntimeError('Для безопасной операции нужен постоянный путь --install-state')
+    def save():
+        secure_json(args.state, state)
+        if checkpoint and Path(args.install_state) != Path(args.state):
+            secure_json(args.install_state, state)
     try:
         if args.command == 'panel_access':
             if args.public is None or not args.install_state:
@@ -4476,6 +4487,14 @@ PY
   emit_panel_helper > "$PANEL_HELPER"
   if [[ "$ACTION" == add-inbound ]]; then HELPER_ARGS+=(--port "$ADD_PORT"); fi
   if [[ "$ACTION" == add-hysteria ]]; then HELPER_ARGS=(--port "$ADD_PORT" --domain "$HYSTERIA_DOMAIN" --salamander "$HYSTERIA_SALAMANDER"); fi
+  if [[ "$ACTION" == parallel-reality || "$ACTION" == recover-parallel ]] || \
+     { [[ "$ACTION" == add-inbound ]] && python3 - "$STATE" <<'PY'
+import json,sys
+sys.exit(0 if json.load(open(sys.argv[1])).get('reality_mode') == 'parallel' else 1)
+PY
+     }; then
+    HELPER_ARGS+=(--install-state /root/selfsteal-3xui/state.json)
+  fi
   if helper "$PANEL_ACTION" "${HELPER_ARGS[@]}"; then
     [[ -z "$PARALLEL_MAP" ]] || rm -f "$PARALLEL_MAP"
     persist_tmp="/root/selfsteal-3xui/state.json.tmp.$$"
