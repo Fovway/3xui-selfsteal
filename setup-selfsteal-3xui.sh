@@ -2782,6 +2782,8 @@ def apply_chain(api, state, save, extra=None):
 
 
 def repair_chain(state, save):
+    if state.get('reality_mode') == 'parallel':
+        raise RuntimeError('В параллельном режиме цепочка не используется; восстановление отменено')
     if state.get('removed') or state.get('pending_add_inbound') or state.get('pending_chain'):
         raise RuntimeError('Установка удалена или есть незавершённая операция; сначала проверьте сохранённое состояние')
     require_version(state)
@@ -2986,7 +2988,9 @@ def add_hysteria(state, port, domain, salamander, save):
         raise
 
 
-def add_inbound(state, port, save):
+def add_inbound(state, port, save, sni=None):
+    if state.get('reality_mode') == 'parallel':
+        return parallel_add_inbound(state, port, sni, save)
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise RuntimeError('Порт должен быть целым числом от 1 до 65535')
     if state.get('removed'):
@@ -3923,6 +3927,169 @@ def migrate_parallel(state, mapping, save):
         raise RuntimeError('Миграция отменена; восстановлены прежние конфигурации nginx, Xray и hosts') from None
 
 
+
+def parallel_existing_rows(state, api):
+    if state.get('reality_mode') != 'parallel':
+        raise RuntimeError('Сначала включите независимую маршрутизацию Reality')
+    rows = {int(r['id']): r for r in api.list()}
+    mapping = state.get('parallel_sni_by_id') or {}
+    primary_id = int(state['inbound_id'])
+    records = []
+    for ref in [{'id': primary_id, 'port': int(state['primary_internal_port'])}] + list(state.get('added_inbounds') or []):
+        rid = int(ref['id'])
+        row = rows.get(rid)
+        sni = parallel_validate_sni(mapping.get(str(rid), ''))
+        port = int(ref['port'])
+        if (not row or row.get('protocol') != 'vless'
+                or int(row.get('port') or 0) != port
+                or row.get('listen') != '127.0.0.1'
+                or parse(row.get('streamSettings') or {}).get('realitySettings', {}).get('serverNames') != [sni]):
+            raise RuntimeError('Независимый Reality изменён вне скрипта: inbound ' + str(rid))
+        records.append({'id': rid, 'sni': sni, 'port': port, 'before': row})
+    if len(records) != len(mapping) or len({r['sni'] for r in records}) != len(records):
+        raise RuntimeError('Состояние SNI расходится с текущим списком inbound')
+    expected_files, _ = parallel_texts(state, records)
+    for path in expected_files:
+        if not path.is_file() or path.is_symlink() or path.read_text() != expected_files[path]:
+            raise RuntimeError('Конфигурация nginx была изменена извне: ' + str(path))
+    return records
+
+
+def parallel_add_inbound(state, port, sni, save):
+    if state.get('removed') or any(state.get(k) for k in (
+            'pending_parallel', 'pending_add_inbound', 'pending_chain', 'pending_hysteria')):
+        raise RuntimeError('Установка удалена или осталась незавершённая операция')
+    sni = parallel_validate_sni(sni)
+    if not isinstance(port, int) or isinstance(port, bool) or not 1024 <= port <= 65535:
+        raise RuntimeError('Внутренний порт должен быть в диапазоне 1024–65535')
+    require_version(state)
+    api = API(state)
+    records = parallel_existing_rows(state, api)
+    if sni in [x['sni'] for x in records]:
+        raise RuntimeError('Этот SNI уже назначен другому Reality inbound')
+    if any(int(x.get('port') or 0) == port and not inbound_uses_udp(x) for x in api.list()):
+        raise RuntimeError('Выбранный TCP-порт занят inbound панели')
+    if port in (443, int(state.get('target_port', 9443))):
+        raise RuntimeError('Этот порт зарезервирован для nginx')
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(('127.0.0.1', port))
+    except OSError:
+        raise RuntimeError('TCP-порт занят другим процессом') from None
+    parallel_dns_check(sni, state['domain'])
+    user = choose_existing_client(api)
+    email = user['client']['email']
+    uid = user['client']['uuid']
+    old_bindings = set(user.get('inboundIds') or [])
+    base = records[0]['before']
+    stream = copy.deepcopy(parse(base['streamSettings']))
+    reality = stream['realitySettings']
+    private = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('=')
+    short_id = secrets.token_hex(8)
+    reality.update(privateKey=private, shortIds=[short_id], serverNames=[sni],
+                   target='127.0.0.1:%d' % int(state.get('target_port', 9443)), xver=1)
+    reality.pop('dest', None)
+    reality.setdefault('settings', {}).update(publicKey=public_key(private), fingerprint='firefox',
+                                                serverName=sni, spiderX='/')
+    stream.setdefault('tcpSettings', {})['acceptProxyProtocol'] = True
+    tag = 'selfsteal-reality-' + str(port)
+    if any(x.get('tag') == tag for x in api.list()):
+        raise RuntimeError('Повторяется служебный тег inbound')
+    inbound = dict(remark=tag, enable=True, expiryTime=0, total=0, up=0, down=0,
+                   port=port, listen='127.0.0.1', protocol='vless', tag=tag,
+                   trafficReset='never', trafficResetDay=1, disableFlow=False,
+                   shareAddrStrategy='custom', shareAddr=sni,
+                   sniffing=json.dumps({'enabled': True, 'destOverride': ['http', 'tls', 'quic'],
+                                        'routeOnly': True}),
+                   settings=json.dumps({'clients': [], 'decryption': 'none', 'fallbacks': []}),
+                   streamSettings=json.dumps(stream))
+    projected = records + [dict(sni=sni, port=port)]
+    contents, root = parallel_texts(state, projected)
+    files = parallel_backup_files(contents)
+    backup = Path('/root/selfsteal-3xui/backups') / (
+        'parallel-add-' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+        + '-' + secrets.token_hex(4))
+    backup.mkdir(mode=0o700, parents=True)
+    secure_json(backup / 'nginx-before.json', files)
+    secure_json(backup / 'state-before.json', state)
+    secure_json(backup / 'user-before.json', user)
+    state['pending_add_inbound'] = dict(port=port, tag=tag, sni=sni, backup=str(backup))
+    save()
+    created_id = None
+    host_id = None
+    try:
+        parallel_ensure_certs(state, projected, contents, root)
+        parallel_write_file(PARALLEL_TLS, contents[PARALLEL_TLS].encode())
+        parallel_nginx()
+        created = api.call('panel/api/inbounds/add', inbound)
+        if not isinstance(created, dict) or created.get('id') is None:
+            raise RuntimeError('Панель не вернула ID нового inbound')
+        created_id = int(created['id'])
+        state['pending_add_inbound']['id'] = created_id
+        save()
+        api.call('panel/api/clients/%s/attach' % urllib.parse.quote(email, safe=''),
+                 {'inboundIds': [created_id]})
+        check_client_binding(api, user, old_bindings | {created_id})
+        api.restart()
+        added = [x for x in api.list() if int(x['id']) == created_id]
+        if len(added) != 1:
+            raise RuntimeError('Панель потеряла созданный Reality inbound')
+        projected[-1].update(id=created_id, before=added[0], after=added[0])
+        parallel_runtime(state, projected)
+        parallel_write_file(PARALLEL_STREAM, contents[PARALLEL_STREAM].encode())
+        parallel_nginx()
+        parallel_probe_443(projected)
+        api.call('panel/api/hosts/add', parallel_host_payload(None, created_id, sni))
+        groups = api.call('panel/api/hosts/list') or []
+        matching = [g for g in groups if g.get('inboundIds') == [created_id]
+                    and g.get('hosts') == [sni]]
+        if len(matching) != 1 or not matching[0].get('groupId'):
+            raise RuntimeError('Новая группа подписки не подтверждена')
+        host_id = str(matching[0]['groupId'])
+        state.setdefault('added_inbounds', []).append(
+            dict(id=created_id, port=port, tag=tag, sni=sni, address=sni,
+                 host_port=443, host_group_id=host_id, client_email=email,
+                 client_uuid=uid))
+        state['parallel_sni_by_id'][str(created_id)] = sni
+        state.pop('pending_add_inbound', None)
+        save()
+        print('Независимый Reality создан: inbound %d, SNI %s, внешний TCP 443.' %
+              (created_id, sni))
+        print('Внутренний порт %d доступен только с localhost.' % port)
+        print('Пользователь %s подключён. Обновите подписку клиента.' % terminal_label(email))
+        print('Резервная копия: ' + str(backup))
+    except Exception:
+        failures = []
+        try:
+            parallel_restore_files(files)
+            parallel_nginx()
+        except Exception:
+            failures.append('nginx')
+        try:
+            if created_id is not None:
+                groups = api.call('panel/api/hosts/list') or []
+                ids = [str(g['groupId']) for g in groups
+                       if g.get('inboundIds') == [created_id] and g.get('groupId')]
+                if ids:
+                    api.call('panel/api/hosts/bulk/del', {'ids': ids})
+                actual = canonical_client(api, email)
+                if created_id in (actual.get('inboundIds') or []):
+                    api.call('panel/api/clients/%s/detach' % urllib.parse.quote(email, safe=''),
+                             {'inboundIds': [created_id]})
+                api.call('panel/api/inbounds/del/%d' % created_id, {})
+                api.restart()
+                check_client_binding(api, user, old_bindings)
+        except Exception:
+            failures.append('3x-ui/Xray')
+        if failures:
+            state['pending_add_inbound']['rollback_incomplete'] = failures
+            save()
+            raise RuntimeError('Откат нового Reality требует проверки: ' + str(backup)) from None
+        state.pop('pending_add_inbound', None)
+        save()
+        raise
+
+
 def recover_parallel(state, save):
     pending = state.get('pending_parallel')
     if not pending:
@@ -3945,6 +4112,7 @@ def main():
     parser.add_argument('--public', choices=['on', 'off'])
     parser.add_argument('--install-state')
     parser.add_argument('--sni-map')
+    parser.add_argument('--sni')
     args = parser.parse_args()
     os.umask(0o077)
     state = json.loads(Path(args.state).read_text())
@@ -3969,7 +4137,7 @@ def main():
         elif args.command == 'configure':
             configure(state, save)
         elif args.command == 'add_inbound':
-            add_inbound(state, args.port, save)
+            add_inbound(state, args.port, save, args.sni)
         elif args.command == 'add_hysteria':
             add_hysteria(state, args.port, args.domain or state.get('domain', ''), args.salamander == 'on', save)
         elif args.command == 'repair_chain':
