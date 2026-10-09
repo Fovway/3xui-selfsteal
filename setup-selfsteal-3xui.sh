@@ -2422,7 +2422,7 @@ def add_hysteria(state, port, domain, salamander, save):
     cert = Path('/etc/letsencrypt/live') / domain / 'fullchain.pem'
     key = Path('/etc/letsencrypt/live') / domain / 'privkey.pem'
     if not cert.is_file() or not key.is_file():
-        raise RuntimeError('Не найден сертификат Let's Encrypt для ' + domain + '. Выпустите его через certbot.')
+        raise RuntimeError("Не найден сертификат Let\'s Encrypt для " + domain + '. Выпустите его через certbot.')
     checks = (
         (['openssl', 'x509', '-in', str(cert), '-noout', '-checkend', '3600'], None),
         (['openssl', 'x509', '-in', str(cert), '-noout', '-checkhost', domain], 'does match certificate'),
