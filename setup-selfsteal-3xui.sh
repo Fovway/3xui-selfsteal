@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.09.2
+SCRIPT_VERSION=2026.10.09.3
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -3450,15 +3450,481 @@ def export(state):
     secure_json(result / 'client-identity.json', {'inbound_id': inbound['id'], 'uuid': client['id'], 'uri_source': 'authenticated panel/api/inbounds/allLinks'})
 
 
+
+# Parallel Reality (opt-in): SNI preread routes independently to localhost.
+# The first inbound keeps its old public address/SNI; each extra inbound needs
+# an independent hostname. Backups contain secrets and are never printed.
+PARALLEL_HEADER = '# Managed by selfsteal-3xui parallel; do not edit manually.\n'
+PARALLEL_STREAM = Path('/etc/nginx/modules-enabled/99-selfsteal-3xui-stream.conf')
+PARALLEL_TLS = Path('/etc/nginx/conf.d/99-selfsteal-3xui-parallel-tls.conf')
+PARALLEL_ACME = Path('/etc/nginx/sites-enabled/99-selfsteal-3xui-parallel-acme.conf')
+
+
+def parallel_validate_sni(value):
+    if not isinstance(value, str):
+        raise RuntimeError('SNI должен быть строкой')
+    value = value.lower().strip().rstrip('.')
+    if (len(value) > 253 or not re.fullmatch(
+            r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', value)):
+        raise RuntimeError('Некорректный SNI: нужен домен ASCII/Punycode')
+    return value
+
+
+def parallel_cert_valid(sni):
+    cert = Path('/etc/letsencrypt/live') / sni / 'fullchain.pem'
+    key = cert.parent / 'privkey.pem'
+    if not cert.is_file() or not key.is_file():
+        return False
+    try:
+        test = subprocess.run(['openssl', 'x509', '-in', str(cert), '-noout',
+                               '-checkhost', sni], capture_output=True, text=True,
+                              timeout=8)
+        expires = subprocess.run(['openssl', 'x509', '-in', str(cert), '-noout',
+                                  '-checkend', '86400'], capture_output=True,
+                                 text=True, timeout=8)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return (test.returncode == 0 and 'does match certificate' in test.stdout
+            and expires.returncode == 0)
+
+
+def parallel_dns_check(sni, main):
+    try:
+        src = {x[4][0] for x in socket.getaddrinfo(main, 443, type=socket.SOCK_STREAM)}
+        dst = {x[4][0] for x in socket.getaddrinfo(sni, 443, type=socket.SOCK_STREAM)}
+    except OSError:
+        raise RuntimeError('DNS для ' + sni + ' не отвечает') from None
+    if not src or not dst or not dst.issubset(src):
+        raise RuntimeError('DNS для ' + sni + ' не совпадает с адресами основного домена')
+
+
+def parallel_preconditions(state, mapping, api):
+    if state.get('removed') or state.get('pending_chain') or state.get('pending_add_inbound') or state.get('pending_hysteria'):
+        raise RuntimeError('Есть незавершённая операция: миграция отменена')
+    if state.get('reality_mode') == 'parallel':
+        raise RuntimeError('Сервер уже работает в параллельном режиме')
+    require_version(state)
+    if not state.get('inbound_id') or not state.get('domain'):
+        raise RuntimeError('Нет управляемого Reality inbound или домена')
+    records = [{'id': state['inbound_id'], 'port': 443, 'sni': state['domain']}]
+    for old in state.get('added_inbounds') or []:
+        ident = str(old['id'])
+        if ident not in mapping:
+            raise RuntimeError('Не задан новый SNI для inbound ID ' + ident)
+        records.append({'id': int(old['id']), 'port': int(old['port']),
+                        'sni': parallel_validate_sni(mapping[ident])})
+    if set(mapping) != {str(r['id']) for r in records[1:]}:
+        raise RuntimeError('Список SNI не соответствует сохранённым inbound')
+    snis = [parallel_validate_sni(r['sni']) for r in records]
+    if len(set(snis)) != len(snis):
+        raise RuntimeError('У каждого Reality должен быть собственный SNI')
+    if len(set(r['port'] for r in records)) != len(records):
+        raise RuntimeError('Найдены повторяющиеся TCP-порты')
+    # Existing chain is checked before modification. Never migrate an unknown
+    # hand-edited deployment whose target or clients cannot be validated.
+    if state.get('reality_chain') and len(records) > 1:
+        for before, expected in chain_plan(api, state):
+            if parse(before['streamSettings']) != parse(expected['streamSettings']):
+                raise RuntimeError('Исходная Reality-цепочка изменена; сначала восстановите её')
+    by_id = {int(row['id']): row for row in api.list()}
+    for r in records:
+        row = by_id.get(int(r['id']))
+        if (not row or row.get('protocol') != 'vless'
+                or int(row.get('port') or 0) != r['port']
+                or parse(row.get('streamSettings') or {}).get('security') != 'reality'):
+            raise RuntimeError('Невозможно безопасно сопоставить inbound ID ' + str(r['id']))
+        r['before'] = copy.deepcopy(row)
+    return records
+
+
+def parallel_pick_port(existing):
+    busy = {int(p) for p in existing}
+    listeners = subprocess.run(['ss', '-H', '-ltn'], capture_output=True, text=True,
+                               timeout=5, check=True).stdout
+    for line in listeners.splitlines():
+        addr = line.split()
+        if len(addr) >= 4:
+            try:
+                busy.add(int(addr[3].rsplit(':', 1)[1]))
+            except (ValueError, IndexError):
+                pass
+    for port in range(10443, 10550):
+        if port not in busy:
+            return port
+    raise RuntimeError('Нет свободного внутреннего TCP-порта для первого Reality')
+
+
+def parallel_texts(state, records):
+    main = parallel_validate_sni(state['domain'])
+    root = Path('/var/www/selfsteal-3xui-' + main)
+    if not root.is_dir() or not (root / 'index.html').is_file():
+        raise RuntimeError('Не найден управляемый HTTPS-сайт заглушки; ручной nginx не перезаписывается')
+    extras = [r for r in records if r['sni'] != main]
+    mapping = [
+        '    ' + r['sni'] + ' 127.0.0.1:' + str(r['port']) + ';'
+        for r in records
+    ]
+    stream = (PARALLEL_HEADER + 'stream {\n'
+              '    map $ssl_preread_server_name $selfsteal_parallel_backend {\n'
+              + '\n'.join(mapping) + '\n'
+              '        default 127.0.0.1:9443;\n'
+              '    }\n'
+              '    server {\n'
+              '        listen 443;\n'
+              '        listen [::]:443;\n'
+              '        ssl_preread on;\n'
+              '        proxy_protocol on;\n'
+              '        proxy_pass $selfsteal_parallel_backend;\n'
+              '        proxy_connect_timeout 5s;\n'
+              '        proxy_timeout 1h;\n'
+              '    }\n'
+              '}\n')
+    tls = PARALLEL_HEADER
+    acme = PARALLEL_HEADER
+    for r in extras:
+        name = r['sni']
+        cert = '/etc/letsencrypt/live/' + name
+        tls += (
+            'server {\n'
+            '    listen 127.0.0.1:9443 ssl http2 proxy_protocol;\n'
+            '    server_name ' + name + ';\n'
+            '    ssl_certificate ' + cert + '/fullchain.pem;\n'
+            '    ssl_certificate_key ' + cert + '/privkey.pem;\n'
+            '    ssl_protocols TLSv1.3;\n'
+            '    set_real_ip_from 127.0.0.1;\n'
+            '    real_ip_header proxy_protocol;\n'
+            '    root ' + str(root) + ';\n'
+            '    location / { try_files $uri $uri/ =404; }\n'
+            '}\n')
+        acme += (
+            'server {\n'
+            '    listen 80;\n'
+            '    listen [::]:80;\n'
+            '    server_name ' + name + ';\n'
+            '    location ^~ /.well-known/acme-challenge/ { root ' + str(root) + '; }\n'
+            '    location / { return 301 https://$host$request_uri; }\n'
+            '}\n')
+    return {PARALLEL_STREAM: stream, PARALLEL_TLS: tls, PARALLEL_ACME: acme}, root
+
+
+def parallel_backup_files(paths):
+    data = {}
+    for path in paths:
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise RuntimeError('Конфликт пути nginx: ' + str(path))
+        if path.is_file() and not path.read_text().startswith(PARALLEL_HEADER):
+            raise RuntimeError('Существующий nginx файл не принадлежит Self-Steal: ' + str(path))
+        data[str(path)] = (dict(exists=True,
+                                content=base64.b64encode(path.read_bytes()).decode(),
+                                mode=path.stat().st_mode & 0o777)
+                           if path.is_file() else dict(exists=False))
+    return data
+
+
+def parallel_write_file(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.tmp-' + secrets.token_hex(6))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'wb') as out:
+        out.write(data)
+        out.flush()
+        os.fsync(out.fileno())
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def parallel_restore_files(files):
+    for name, entry in files.items():
+        path = Path(name)
+        if not path.exists() and not entry['exists']:
+            continue
+        if path.is_symlink():
+            raise RuntimeError('Путь nginx изменился на символьную ссылку: ' + name)
+        if entry['exists']:
+            parallel_write_file(path, base64.b64decode(entry['content']))
+            os.chmod(path, entry['mode'])
+        else:
+            if path.is_file():
+                path.unlink()
+
+
+def parallel_nginx(action='reload'):
+    tested = subprocess.run(['nginx', '-t'], capture_output=True, text=True,
+                            timeout=12)
+    if tested.returncode:
+        raise RuntimeError('nginx -t не принял подготовленную конфигурацию')
+    subprocess.run(['systemctl', action, 'nginx'], check=True,
+                   capture_output=True, timeout=25)
+
+
+def parallel_ensure_certs(state, records, texts, root):
+    # To obtain certificates without taking the existing 443 listener offline,
+    # add a temporary (then retained for renewal) HTTP-01 virtual host.
+    parallel_write_file(PARALLEL_ACME, texts[PARALLEL_ACME].encode())
+    parallel_nginx()
+    for r in records[1:]:
+        sni = r['sni']
+        if parallel_cert_valid(sni):
+            continue
+        cmd = ['certbot', 'certonly', '--webroot', '-w', str(root),
+               '--non-interactive', '--agree-tos',
+               '--register-unsafely-without-email',
+               '--keep-until-expiring', '-d', sni]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        except (OSError, subprocess.TimeoutExpired):
+            raise RuntimeError('Не удалось выпустить сертификат для ' + sni) from None
+        if p.returncode or not parallel_cert_valid(sni):
+            raise RuntimeError('Не удалось проверить сертификат ' + sni
+                               + '; проверьте DNS, TCP 80 и certbot')
+
+
+def parallel_runtime(state, records):
+    path = Path(state.get('runtime_config') or str(
+        Path(state['panel_binary']).parent / 'bin/config.json'))
+    for _ in range(30):
+        try:
+            config = json.loads(path.read_text())
+            live = config.get('inbounds') or []
+            for r in records:
+                rows = [x for x in live if x.get('tag') == r['before']['tag']
+                        and int(x.get('port') or 0) == int(r['port'])]
+                if len(rows) != 1 or rows[0].get('protocol') != 'vless':
+                    raise ValueError('runtime row is missing')
+                rt = rows[0].get('streamSettings') or {}
+                configured = parse(r['after']['streamSettings'])
+                expected = configured['realitySettings']
+                live_reality = rt.get('realitySettings') or {}
+                if (live_reality.get('privateKey') != expected['privateKey']
+                        or live_reality.get('shortIds') != expected['shortIds']
+                        or live_reality.get('serverNames') != [r['sni']]
+                        or (live_reality.get('target') or live_reality.get('dest')) != expected['target']
+                        or not (rt.get('tcpSettings') or {}).get('acceptProxyProtocol')):
+                    raise ValueError('runtime does not match')
+            return
+        except (OSError, ValueError, KeyError, TypeError):
+            time.sleep(1)
+    raise RuntimeError('Xray не подтвердил работу независимых inbound')
+
+
+def parallel_probe_443(records):
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    for r in records:
+        try:
+            with socket.create_connection(('127.0.0.1', 443), timeout=8) as raw:
+                raw.settimeout(8)
+                with context.wrap_socket(raw, server_hostname=r['sni']) as tls:
+                    tls.sendall(('HEAD / HTTP/1.1\r\nHost: ' + r['sni']
+                                 + '\r\nConnection: close\r\n\r\n').encode())
+                    line = tls.recv(512).split(b'\r\n', 1)[0]
+                    if not re.match(rb'^HTTP/1\.[01] [2345]\d\d', line):
+                        raise RuntimeError('Необычный HTTP-ответ через Reality')
+        except (OSError, ssl.SSLError) as exc:
+            raise RuntimeError('Локальный HTTPS fallback недоступен для ' + r['sni']) from exc
+
+
+def parallel_host_payload(row, inbound_id, sni):
+    # Existing groupId remains unchanged with the documented update API.
+    fields = ('inboundIds', 'remark', 'hosts', 'port', 'security', 'sni',
+              'hostHeader', 'path', 'alpn', 'isDisabled', 'isHidden', 'tags')
+    if row:
+        result = {key: copy.deepcopy(row[key]) for key in fields if key in row}
+    else:
+        result = dict(remark='selfsteal-parallel-443', alpn=[], tags=[],
+                      isDisabled=False, isHidden=False, security='same')
+    result.update(inboundIds=[int(inbound_id)], hosts=[sni], port=443,
+                  security='same', sni=sni)
+    return result
+
+
+def parallel_host_group(api, inbound_id, groups):
+    found = [g for g in groups if g.get('inboundIds') == [int(inbound_id)]]
+    if len(found) > 1:
+        raise RuntimeError('У inbound несколько групп hosts; автоматическая миграция отменена')
+    return found[0] if found else None
+
+
+def parallel_hosts_apply(api, records, old_groups):
+    created = []
+    for r in records:
+        prior = parallel_host_group(api, int(r['id']), old_groups)
+        payload_value = parallel_host_payload(prior, r['id'], r['sni'])
+        if prior and prior.get('groupId'):
+            api.call('panel/api/hosts/update/' + str(prior['groupId']), payload_value)
+        else:
+            api.call('panel/api/hosts/add', payload_value)
+            updated = api.call('panel/api/hosts/list') or []
+            found = [g for g in updated if g.get('inboundIds') == [int(r['id'])]
+                     and g.get('hosts') == [r['sni']]]
+            if len(found) != 1 or not found[0].get('groupId'):
+                raise RuntimeError('Не удалось подтвердить созданную группу hosts')
+            created.append(str(found[0]['groupId']))
+    return created
+
+
+def parallel_hosts_restore(api, records, originals):
+    now = api.call('panel/api/hosts/list') or []
+    for r in records:
+        before = parallel_host_group(api, int(r['id']), originals)
+        current = parallel_host_group(api, int(r['id']), now)
+        if before and current and before.get('groupId') == current.get('groupId'):
+            api.call('panel/api/hosts/update/' + str(before['groupId']),
+                     parallel_host_payload_restore(before))
+        elif before and not current:
+            api.call('panel/api/hosts/add', parallel_host_payload_restore(before))
+        elif not before and current and current.get('groupId'):
+            api.call('panel/api/hosts/bulk/del', {'ids': [str(current['groupId'])]})
+
+
+def parallel_host_payload_restore(group):
+    allowed = ('inboundIds', 'remark', 'hosts', 'port', 'security', 'sni',
+               'hostHeader', 'path', 'alpn', 'isDisabled', 'isHidden', 'tags')
+    return {key: copy.deepcopy(group[key]) for key in allowed if key in group}
+
+
+def parallel_restore_backup(state, api, backup, save):
+    original = json.loads((backup / 'state-before.json').read_text())
+    old_inbounds = json.loads((backup / 'inbounds-before.json').read_text())
+    old_groups = json.loads((backup / 'hosts-before.json').read_text())
+    files = json.loads((backup / 'nginx-before.json').read_text())
+    # Release 443 from nginx before restarting the original Xray inbound on 443.
+    parallel_restore_files(files)
+    parallel_nginx()
+    for old in old_inbounds:
+        api.call('panel/api/inbounds/update/%s' % old['id'], payload(old))
+    api.restart()
+    parallel_hosts_restore(api, [{'id': x['id']} for x in old_inbounds], old_groups)
+    state.clear()
+    state.update(original)
+    save()
+
+
+def migrate_parallel(state, mapping, save):
+    if state.get('pending_parallel'):
+        raise RuntimeError('Есть незавершённая параллельная миграция. Сначала восстановите её.')
+    api = API(state)
+    records = parallel_preconditions(state, mapping, api)
+    for r in records:
+        parallel_dns_check(r['sni'], state['domain'])
+    port = parallel_pick_port([x.get('port') for x in api.list()])
+    records[0]['port'] = port
+    for r in records:
+        old = r['before']
+        after = copy.deepcopy(old)
+        stream = copy.deepcopy(parse(old['streamSettings']))
+        reality = stream['realitySettings']
+        reality.update(target='127.0.0.1:' + str(state.get('target_port', 9443)),
+                       serverNames=[r['sni']], xver=1)
+        reality.pop('dest', None)
+        tcp = stream.setdefault('tcpSettings', {})
+        tcp['acceptProxyProtocol'] = True
+        after['streamSettings'] = json.dumps(stream)
+        after['port'] = r['port']
+        after['listen'] = '127.0.0.1'
+        after['shareAddrStrategy'] = 'custom'
+        after['shareAddr'] = r['sni']
+        r['after'] = after
+    texts, root = parallel_texts(state, records)
+    if not re.search(r'(?m)^\s*include\s+/etc/nginx/modules-enabled/\*\.conf\s*;',
+                     Path('/etc/nginx/nginx.conf').read_text()):
+        raise RuntimeError('nginx.conf не включает modules-enabled; безопасная миграция невозможна')
+    if not Path('/usr/lib/nginx/modules/ngx_stream_module.so').is_file():
+        raise RuntimeError('Не установлен модуль nginx stream: sudo apt-get install libnginx-mod-stream')
+    for r in records[1:]:
+        if parallel_host_group(api, r['id'], api.call('panel/api/hosts/list') or []) is None:
+            raise RuntimeError('Не найдена группа подписки для дополнительного inbound')
+    original = copy.deepcopy(state)
+    backup = Path('/root/selfsteal-3xui/backups') / (
+        'parallel-' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-'
+        + secrets.token_hex(4))
+    backup.mkdir(parents=True, mode=0o700)
+    files = parallel_backup_files(texts)
+    groups = api.call('panel/api/hosts/list') or []
+    secure_json(backup / 'state-before.json', original)
+    secure_json(backup / 'inbounds-before.json', [r['before'] for r in records])
+    secure_json(backup / 'hosts-before.json', groups)
+    secure_json(backup / 'nginx-before.json', files)
+    with db_read(state) as read_db, sqlite3.connect(backup / 'panel-before.db') as dest:
+        read_db.backup(dest)
+    os.chmod(backup / 'panel-before.db', 0o600)
+    state['pending_parallel'] = {'backup': str(backup), 'stage': 'certificates'}
+    save()
+    try:
+        parallel_ensure_certs(state, records, texts, root)
+        parallel_write_file(PARALLEL_TLS, texts[PARALLEL_TLS].encode())
+        # Validate the new TLS vhosts before moving the public port.
+        parallel_nginx()
+        state['pending_parallel']['stage'] = 'xray'
+        save()
+        for r in records:
+            api.call('panel/api/inbounds/update/%s' % r['id'], payload(r['after']))
+        api.restart()
+        parallel_runtime(state, records)
+        state['pending_parallel']['stage'] = 'nginx-stream'
+        save()
+        parallel_write_file(PARALLEL_STREAM, texts[PARALLEL_STREAM].encode())
+        parallel_nginx()
+        parallel_probe_443(records)
+        state['pending_parallel']['stage'] = 'subscriptions'
+        save()
+        parallel_hosts_apply(api, records, groups)
+        # No user identities, UUIDs, keys, shortIds, subscription IDs, or expiry
+        # values are regenerated during the migration.
+        for r in records:
+            actual = next(x for x in api.list() if int(x['id']) == int(r['id']))
+            if (parse(actual['settings']) != parse(r['before']['settings'])
+                    or parse(actual['streamSettings']) != parse(r['after']['streamSettings'])):
+                raise RuntimeError('Изменены параметры клиента или Reality на inbound ' + str(r['id']))
+        state['reality_mode'] = 'parallel'
+        state['reality_chain'] = False
+        state['primary_internal_port'] = port
+        state['parallel_sni_by_id'] = {str(r['id']): r['sni'] for r in records}
+        for row in state.get('added_inbounds') or []:
+            row['sni'] = state['parallel_sni_by_id'][str(row['id'])]
+            row['address'] = row['sni']
+        state['parallel_backup'] = str(backup)
+        state.pop('pending_parallel', None)
+        save()
+        print('Независимые Reality включены через nginx TCP 443.')
+        for r in records:
+            print('Inbound ID %s: %s -> 127.0.0.1:%d' % (r['id'], r['sni'], r['port']))
+        print('Ключи и пользователи сохранены. Обновите ссылки дополнительных Reality в приложениях.')
+        print('Резервная копия: ' + str(backup))
+    except Exception:
+        try:
+            parallel_restore_backup(state, api, backup, save)
+        except Exception:
+            state['pending_parallel'] = {'backup': str(backup),
+                                         'rollback_incomplete': True}
+            save()
+            raise RuntimeError('Миграция не завершена и автоматический откат требует проверки. '
+                               'Резервная копия: ' + str(backup)) from None
+        raise RuntimeError('Миграция отменена; восстановлены прежние конфигурации nginx, Xray и hosts') from None
+
+
+def recover_parallel(state, save):
+    pending = state.get('pending_parallel')
+    if not pending:
+        raise RuntimeError('Нет незавершённой миграции для восстановления')
+    backup = Path(pending['backup'])
+    if not backup.is_dir() or backup.parent != Path('/root/selfsteal-3xui/backups'):
+        raise RuntimeError('Некорректный путь резервной копии')
+    api = API(state)
+    parallel_restore_backup(state, api, backup, save)
+    print('Исходная Reality-цепочка восстановлена из ' + str(backup))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'add_hysteria', 'repair_chain', 'export', 'verify', 'rollback', 'route_preflight', 'publish', 'panel_access'])
+    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'add_hysteria', 'repair_chain', 'export', 'verify', 'rollback', 'route_preflight', 'publish', 'panel_access', 'migrate_parallel', 'recover_parallel'])
     parser.add_argument('--state', required=True)
     parser.add_argument('--port', type=int)
     parser.add_argument('--domain')
     parser.add_argument('--salamander', choices=['on', 'off'], default='on')
     parser.add_argument('--public', choices=['on', 'off'])
     parser.add_argument('--install-state')
+    parser.add_argument('--sni-map')
     args = parser.parse_args()
     os.umask(0o077)
     state = json.loads(Path(args.state).read_text())
@@ -3471,6 +3937,15 @@ def main():
             if args.public is None or not args.install_state:
                 raise RuntimeError('Не указаны режим доступа или путь состояния установки')
             panel_access(state, args.public == 'on', args.install_state)
+        elif args.command == 'migrate_parallel':
+            if not args.sni_map:
+                raise RuntimeError('Для миграции нужен файл сопоставления SNI')
+            mapping = json.loads(Path(args.sni_map).read_text())
+            if not isinstance(mapping, dict):
+                raise RuntimeError('Ожидается JSON словарь ID → SNI')
+            migrate_parallel(state, mapping, save)
+        elif args.command == 'recover_parallel':
+            recover_parallel(state, save)
         elif args.command == 'configure':
             configure(state, save)
         elif args.command == 'add_inbound':
