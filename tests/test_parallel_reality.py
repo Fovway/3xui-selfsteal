@@ -84,5 +84,39 @@ class ParallelTests(unittest.TestCase):
             helper.repair_chain(dict(self.state), lambda: None)
 
 
+    def test_runtime_must_bind_loopback_not_public_ip(self):
+        import json
+        state = dict(self.state, panel_binary='/usr/local/x-ui/x-ui')
+        row = dict(tag='selfsteal-reality-10443', protocol='vless', port=10443,
+                   listen='0.0.0.0',
+                   streamSettings={'security': 'reality', 'tcpSettings': {'acceptProxyProtocol': True},
+                                   'realitySettings': {'privateKey': 'secret', 'shortIds': ['aa'],
+                                                      'serverNames': ['main.example.com'],
+                                                      'target': '127.0.0.1:9443'}})
+        before = dict(row, listen='127.0.0.1',
+                      streamSettings=json.dumps(row['streamSettings']))
+        records = [{'id': 12, 'port': 10443, 'sni': 'main.example.com',
+                    'before': before, 'after': before}]
+        runtime = json.dumps({'inbounds': [row]})
+        with patch.object(helper.Path, 'read_text', return_value=runtime), \
+                patch.object(helper.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'не подтвердил'):
+                helper.parallel_runtime(state, records)
+
+    def test_recovery_rejects_untrusted_backup_path(self):
+        state = {'pending_parallel': {'backup': '/tmp/user-controlled'}}
+        with self.assertRaisesRegex(RuntimeError, 'путь'):
+            helper.recover_parallel(state, lambda: None)
+
+    def test_inbound_duplicate_sni_never_calls_panel(self):
+        state = dict(self.state, panel_binary='/usr/local/x-ui/x-ui')
+        with patch.object(helper, 'require_version'), \
+                patch.object(helper, 'API'), \
+                patch.object(helper, 'parallel_existing_rows', return_value=[
+                    {'sni': 'main.example.com'}, {'sni': 'edge.example.com'}]):
+            with self.assertRaisesRegex(RuntimeError, 'уже назначен'):
+                helper.parallel_add_inbound(state, 10455, 'edge.example.com', lambda: None)
+
+
 if __name__ == '__main__':
     unittest.main()
