@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.09.8
+SCRIPT_VERSION=2026.10.09.9
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/feature/parallel-reality-sni/setup-selfsteal-3xui.sh
@@ -14,10 +14,11 @@ unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy
 CHECK=0
 DOMAIN=''
 ACTION='menu'
+ADOPT_BINDINGS=()
 while (( $# )); do
   case $1 in
     --help|-h) cat <<'HELP'
-Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--parallel-reality|--parallel-preflight|--recover-parallel|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access|--tests|--add-hysteria|--masking-audit]
+Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--parallel-reality|--parallel-preflight|--adopt-preflight|--adopt-existing|--recover-adopt|--recover-parallel|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access|--tests|--add-hysteria|--masking-audit]
 Без аргументов открывается главное меню. При первом запуске меню устанавливается команда selfsteal.
 --install-script устанавливает текущую копию скрипта как /usr/local/bin/selfsteal.
 --update-script обновляет команду selfsteal из рабочей ветки feature/parallel-reality-sni после проверки синтаксиса.
@@ -27,6 +28,9 @@ while (( $# )); do
 --repair-chain восстанавливает прежнюю последовательную Reality-цепочку (только для старого режима).
 --parallel-reality преобразует имеющуюся Reality-цепочку в независимые inbound за nginx:443 по разным SNI с автоматическим откатом.
 --parallel-preflight проверяет условия миграции (включая HTTPS-заглушку) без изменения nginx, Xray и панели.
+--adopt-preflight --adopt-sni ID=ДОМЕН проверяет подключение существующих VLESS Reality к внешнему TCP 443 без изменений.
+--adopt-existing --adopt-sni ID=ДОМЕН подключает существующие Reality inbound и их пользователей через разные SNI на TCP 443 с откатом.
+--recover-adopt восстанавливает исходные настройки после прерванной операции подключения существующих inbound.
 --uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
 --status показывает состояние по пунктам без изменений.
 --masking-audit проверяет маскировку Reality/TLS/HTTPS/Hysteria и закрытость панели, не изменяя конфигурацию.
@@ -54,6 +58,10 @@ HELP
     --parallel-reality) ACTION=parallel-reality; shift ;;
     --parallel-preflight) ACTION=parallel-preflight; shift ;;
     --recover-parallel) ACTION=recover-parallel; shift ;;
+    --adopt-preflight) ACTION=adopt-preflight; shift ;;
+    --adopt-existing) ACTION=adopt-existing; shift ;;
+    --recover-adopt) ACTION=recover-adopt; shift ;;
+    --adopt-sni) [[ $# -ge 2 ]] || fail 'Укажите ID=ДОМЕН после --adopt-sni'; ADOPT_BINDINGS+=("$2"); shift 2 ;;
     --uninstall|--remove) ACTION=uninstall; shift ;;
     --panel-access) ACTION=panel-access; shift ;;
     --tests) ACTION=vps-tests; shift ;;
@@ -64,6 +72,7 @@ HELP
     *) printf 'Неизвестный аргумент: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
+[[ ${#ADOPT_BINDINGS[@]} == 0 || $ACTION == adopt-preflight || $ACTION == adopt-existing ]] || fail '--adopt-sni допускается только с --adopt-preflight или --adopt-existing'
 [[ -z $DOMAIN || $CHECK == 1 ]] || { echo '--domain поддерживается только вместе с --check' >&2; exit 2; }
 fail() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 
@@ -4376,7 +4385,7 @@ def parallel_test_client_runtime(state, tag, port, client):
 
 def parallel_add_inbound(state, port, sni, save):
     if state.get('removed') or any(state.get(k) for k in (
-            'pending_parallel', 'pending_add_inbound', 'pending_chain', 'pending_hysteria')):
+            'pending_parallel', 'pending_add_inbound', 'pending_chain', 'pending_hysteria', 'pending_adopt')):
         raise RuntimeError('Установка удалена или осталась незавершённая операция')
     sni = parallel_validate_sni(sni)
     if not isinstance(port, int) or isinstance(port, bool) or not 1024 <= port <= 65535:
@@ -4533,6 +4542,225 @@ def parallel_add_inbound(state, port, sni, save):
         raise
 
 
+def parallel_adopt_plan(state, mapping, api):
+    """Read-only validation for adopting pre-existing VLESS Reality/TCP rows."""
+    if (state.get('removed') or state.get('reality_mode') != 'parallel'
+            or any(state.get(k) for k in (
+                'pending_parallel', 'pending_chain', 'pending_hysteria',
+                'pending_add_inbound', 'pending_adopt'))):
+        raise RuntimeError('Незавершённая операция либо общий Reality 443 не активирован')
+    if not isinstance(mapping, dict) or not mapping:
+        raise RuntimeError('Нужны ID и SNI существующих inbound для подключения')
+    require_version(state)
+    existing = parallel_existing_rows(state, api)
+    active_ids = {int(r['id']) for r in existing}
+    occupied_ports = {int(r['port']) for r in existing}
+    occupied_snis = {r['sni'] for r in existing}
+    rows = api.list()
+    indexed = {int(r['id']): r for r in rows}
+    groups = api.call('panel/api/hosts/list') or []
+    planned = []
+    for raw_id, requested_sni in mapping.items():
+        try:
+            rid = int(raw_id)
+        except (TypeError, ValueError):
+            raise RuntimeError('ID inbound должен быть целым числом') from None
+        if str(rid) != str(raw_id) or rid <= 0 or rid in active_ids:
+            raise RuntimeError('Inbound ID %s уже обслуживается или указан неверно' % raw_id)
+        before = indexed.get(rid)
+        if not before:
+            raise RuntimeError('Inbound ID %d отсутствует в 3x-ui' % rid)
+        port = int(before.get('port') or 0)
+        stream = parse(before.get('streamSettings') or {})
+        reality = stream.get('realitySettings') or {}
+        if (before.get('nodeId') or not before.get('enable', True)
+                or before.get('protocol') != 'vless'
+                or not 1024 <= port <= 65535 or port in (443, 9443)
+                or port in occupied_ports
+                or before.get('listen') != '127.0.0.1'
+                or stream.get('security') != 'reality'
+                or stream.get('network') not in ('tcp', 'raw')
+                or not reality.get('privateKey') or not reality.get('shortIds')
+                or not reality.get('serverNames')):
+            raise RuntimeError('Inbound ID %d не соответствует безопасному Reality/TCP на loopback' %
+                               rid)
+        if not isinstance(parse(before.get('settings') or {}), dict):
+            raise RuntimeError('Inbound ID %d имеет некорректные настройки пользователей' % rid)
+        # A shared or multiply-bound host group is not safely adoptable.
+        linked = [g for g in groups if rid in (g.get('inboundIds') or [])]
+        if (len(linked) > 1 or any(g.get('inboundIds') != [rid] for g in linked)
+                or (linked and not linked[0].get('groupId'))):
+            raise RuntimeError('Inbound ID %d имеет общую/неоднозначную группу hosts' % rid)
+        sni = parallel_validate_sni(requested_sni)
+        if sni in occupied_snis:
+            raise RuntimeError('SNI %s уже занят другим inbound' % sni)
+        parallel_dns_check(sni, state['domain'])
+        desired = copy.deepcopy(before)
+        next_stream = copy.deepcopy(stream)
+        next_reality = next_stream['realitySettings']
+        next_reality.update(serverNames=[sni],
+                            target='127.0.0.1:%d' % int(state.get('target_port', 9443)),
+                            xver=1)
+        next_reality.pop('dest', None)
+        if isinstance(next_reality.get('settings'), dict):
+            next_reality['settings']['serverName'] = sni
+        next_stream.setdefault('tcpSettings', {})['acceptProxyProtocol'] = True
+        desired['streamSettings'] = json.dumps(next_stream)
+        desired['shareAddrStrategy'] = 'custom'
+        desired['shareAddr'] = sni
+        planned.append({'id': rid, 'port': port, 'sni': sni,
+                        'before': before, 'after': desired})
+        occupied_ports.add(port)
+        occupied_snis.add(sni)
+    # Confirm actual Xray listeners, not only database rows.
+    sockets = subprocess.run(['ss', '-H', '-ltnp'], capture_output=True,
+                             text=True, timeout=8, check=True)
+    parallel_live_listeners(sockets.stdout, planned)
+    # A managed stream must be owned by this script before replacing it.
+    parallel_texts(state, existing + planned)
+    return existing, planned, groups
+
+
+def parallel_adopt_rollback(state, api, backup, save):
+    """Return only adopted inbounds and owned nginx files to pre-cutover state."""
+    original = json.loads((backup / 'state-before.json').read_text())
+    before_rows = json.loads((backup / 'inbounds-before.json').read_text())
+    planned = json.loads((backup / 'inbounds-after.json').read_text())
+    former_groups = json.loads((backup / 'hosts-before.json').read_text())
+    former_files = json.loads((backup / 'nginx-before.json').read_text())
+    expected = {int(x['id']): x for x in planned}
+    present = {int(x['id']): x for x in api.list()}
+    edits = []
+    for old in before_rows:
+        ident = int(old['id'])
+        current = present.get(ident)
+        restored = parallel_rollback_inbound(old, current, expected[ident])
+        if any(parse(current.get(k)) != parse(restored.get(k)) for k in
+               ('port', 'listen', 'streamSettings', 'shareAddrStrategy', 'shareAddr')):
+            edits.append((ident, restored))
+    # Preserve external 443 ownership: never disable existing stream listeners.
+    parallel_restore_files(former_files)
+    parallel_nginx()
+    for ident, body in edits:
+        api.call('panel/api/inbounds/update/%d' % ident, body)
+    if edits:
+        api.restart()
+        new_rows = {int(r['id']): r for r in api.list()}
+        for ident, restored in edits:
+            actual = new_rows.get(ident)
+            if not actual or any(
+                    parse(actual.get(k)) != parse(restored.get(k))
+                    for k in ('streamSettings', 'listen', 'port')):
+                raise RuntimeError('После отката inbound ID %d имеет другие настройки' % ident)
+            old_ids = {c['id'] for c in
+                       parse(next(row for row in before_rows
+                                  if int(row['id']) == ident)['settings']).get('clients', [])}
+            got_ids = {c.get('id') for c in
+                       parse(actual.get('settings') or {}).get('clients', [])}
+            if not old_ids.issubset(got_ids):
+                raise RuntimeError('Откат inbound ID %d потерял UUID пользователей' % ident)
+    if state.get('pending_adopt', {}).get('stage') == 'subscriptions':
+        parallel_hosts_restore(api, before_rows, former_groups)
+    state.clear()
+    state.update(original)
+    save()
+
+
+def parallel_adopt_existing(state, mapping, save, dry_run=False):
+    api = API(state)
+    existing, candidates, groups = parallel_adopt_plan(state, mapping, api)
+    projected = existing + candidates
+    files, root = parallel_texts(state, projected)
+    originals = parallel_backup_files(files)
+    if dry_run:
+        for r in candidates:
+            print('Готово: существующий inbound ID %d, TCP %d -> SNI %s:443, '
+                  'клиенты и ключи сохраняются, сертификат: %s' %
+                  (r['id'], r['port'], r['sni'],
+                   'есть' if parallel_cert_valid(r['sni']) else 'будет выпущен'))
+        print('Предварительная проверка завершена. Ничего не изменено.')
+        return
+    backup = Path('/root/selfsteal-3xui/backups') / (
+        'parallel-adopt-' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+        + '-' + secrets.token_hex(4))
+    backup.mkdir(parents=True, mode=0o700)
+    secure_json(backup / 'state-before.json', state)
+    secure_json(backup / 'inbounds-before.json', [r['before'] for r in candidates])
+    secure_json(backup / 'inbounds-after.json', [r['after'] for r in candidates])
+    secure_json(backup / 'hosts-before.json', groups)
+    secure_json(backup / 'nginx-before.json', originals)
+    with db_read(state) as source_db, sqlite3.connect(backup / 'panel-before.db') as target_db:
+        source_db.backup(target_db)
+    os.chmod(backup / 'panel-before.db', 0o600)
+    state['pending_adopt'] = {'backup': str(backup), 'stage': 'certificates'}
+    save()
+    try:
+        parallel_ensure_certs(state, projected, files, root)
+        parallel_write_file(PARALLEL_TLS, files[PARALLEL_TLS].encode())
+        parallel_nginx()
+        for r in candidates:
+            parallel_probe_fallback([r], int(state.get('target_port', 9443)))
+        state['pending_adopt']['stage'] = 'xray'
+        save()
+        for r in candidates:
+            api.call('panel/api/inbounds/update/%d' % r['id'], payload(r['after']))
+        api.restart()
+        parallel_runtime(state, projected, api)
+        state['pending_adopt']['stage'] = 'nginx-stream'
+        save()
+        parallel_write_file(PARALLEL_STREAM, files[PARALLEL_STREAM].encode())
+        parallel_nginx()
+        parallel_probe_443(projected)
+        state['pending_adopt']['stage'] = 'subscriptions'
+        save()
+        parallel_hosts_apply(api, candidates, groups)
+        parallel_panel_runtime(projected, api.list())
+        for r in candidates:
+            state.setdefault('added_inbounds', []).append(
+                {'id': r['id'], 'port': r['port'], 'tag': r['before']['tag'],
+                 'sni': r['sni'], 'address': r['sni'], 'host_port': 443})
+            state.setdefault('parallel_sni_by_id', {})[str(r['id'])] = r['sni']
+        state.pop('pending_adopt', None)
+        save()
+        print('Существующие Reality inbound подключены к общему внешнему TCP 443.')
+        for r in candidates:
+            print('  Inbound ID %d: %s -> 127.0.0.1:%d' %
+                  (r['id'], r['sni'], r['port']))
+        print('Исходные ключи, пользователи и UUID сохранены. Клиентские ссылки '
+              'для новых SNI/порта необходимо обновить.')
+        print('Резервная копия: ' + str(backup))
+    except Exception as exc:
+        stage = state.get('pending_adopt', {}).get('stage', 'unknown')
+        detail = str(exc).replace('\n', ' ')[:300] if isinstance(exc, RuntimeError) else type(exc).__name__
+        try:
+            secure_json(backup / 'adopt-failure.json', {'stage': stage,
+                        'error_type': type(exc).__name__, 'reason': detail})
+        except OSError:
+            pass
+        try:
+            parallel_adopt_rollback(state, api, backup, save)
+        except Exception as rollback_exc:
+            state['pending_adopt']['rollback_incomplete'] = True
+            save()
+            raise RuntimeError('Подключение inbound: ' + stage + ': ' + detail
+                               + '; требуется проверка отката ('
+                               + type(rollback_exc).__name__ + '), копия: ' +
+                               str(backup)) from None
+        raise RuntimeError('Подключение inbound: ' + stage + ': ' + detail
+                           + '; прежние настройки восстановлены. Отчёт: ' +
+                           str(backup / 'adopt-failure.json')) from None
+
+
+def recover_adopt(state, save):
+    if not state.get('pending_adopt'):
+        raise RuntimeError('Нет прерванного подключения inbound для восстановления')
+    backup = Path(state['pending_adopt']['backup'])
+    if (not backup.is_dir() or backup.is_symlink()
+            or backup.parent != Path('/root/selfsteal-3xui/backups')):
+        raise RuntimeError('Неправильный путь резервной копии adopt')
+    parallel_adopt_rollback(state, API(state), backup, save)
+    print('Восстановлено состояние до подключения существующих inbound.')
+
 def recover_parallel(state, save):
     pending = state.get('pending_parallel')
     if not pending:
@@ -4547,7 +4775,7 @@ def recover_parallel(state, save):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'add_hysteria', 'repair_chain', 'export', 'verify', 'rollback', 'route_preflight', 'publish', 'panel_access', 'migrate_parallel', 'parallel_preflight', 'recover_parallel'])
+    parser.add_argument('command', choices=['inspect', 'authenticate', 'bootstrap', 'configure', 'add_inbound', 'add_hysteria', 'repair_chain', 'export', 'verify', 'rollback', 'route_preflight', 'publish', 'panel_access', 'migrate_parallel', 'parallel_preflight', 'recover_parallel', 'adopt_existing', 'adopt_preflight', 'recover_adopt'])
     parser.add_argument('--state', required=True)
     parser.add_argument('--port', type=int)
     parser.add_argument('--domain')
@@ -4565,7 +4793,7 @@ def main():
     # Parallel cutovers can outlive an SSH connection. Save each stage in the
     # canonical state file as well as the scratch copy so --recover-parallel
     # can find the rollback journal even after SIGKILL or a power failure.
-    checkpoint = (args.command in ('migrate_parallel', 'recover_parallel')
+    checkpoint = (args.command in ('migrate_parallel', 'recover_parallel', 'adopt_existing', 'recover_adopt')
                   or (args.command == 'add_inbound'
                       and state.get('reality_mode') == 'parallel'))
     if checkpoint and not args.install_state:
@@ -4586,6 +4814,14 @@ def main():
             if not isinstance(mapping, dict):
                 raise RuntimeError('Ожидается JSON словарь ID → SNI')
             migrate_parallel(state, mapping, save, dry_run=args.command == 'parallel_preflight')
+        elif args.command in ('adopt_existing', 'adopt_preflight'):
+            if not args.sni_map:
+                raise RuntimeError('Не указаны ID=SNI существующих inbound')
+            mapping = json.loads(Path(args.sni_map).read_text())
+            parallel_adopt_existing(state, mapping, save,
+                                    dry_run=args.command == 'adopt_preflight')
+        elif args.command == 'recover_adopt':
+            recover_adopt(state, save)
         elif args.command == 'recover_parallel':
             recover_parallel(state, save)
         elif args.command == 'configure':
@@ -4598,7 +4834,7 @@ def main():
             repair_chain(state, save)
         else:
             globals()[args.command](state)
-        if args.command != 'parallel_preflight':
+        if args.command not in ('parallel_preflight', 'adopt_preflight'):
             save()
     except Exception as exc:
         save()
@@ -4734,7 +4970,7 @@ PY
   exit 0
 fi
 
-if [[ "$ACTION" == add-inbound || "$ACTION" == add-hysteria || "$ACTION" == repair-chain || "$ACTION" == parallel-reality || "$ACTION" == parallel-preflight || "$ACTION" == recover-parallel ]]; then
+if [[ "$ACTION" == add-inbound || "$ACTION" == add-hysteria || "$ACTION" == repair-chain || "$ACTION" == parallel-reality || "$ACTION" == parallel-preflight || "$ACTION" == recover-parallel || "$ACTION" == adopt-existing || "$ACTION" == adopt-preflight || "$ACTION" == recover-adopt ]]; then
   echo
   echo '==============================================='
   echo '        3xUI Self-Steal — создание inbound'
@@ -4747,6 +4983,36 @@ if [[ "$ACTION" == add-inbound || "$ACTION" == add-hysteria || "$ACTION" == repa
   HYSTERIA_DOMAIN=''
   HYSTERIA_SALAMANDER=on
   PARALLEL_MAP=''
+  if [[ "$ACTION" == adopt-existing || "$ACTION" == adopt-preflight || "$ACTION" == recover-adopt ]]; then
+    if [[ "$ACTION" == recover-adopt ]]; then
+      PANEL_ACTION=recover_adopt
+      read -r -p 'Для восстановления существующих inbound введите RECOVER ADOPT: ' ADOPT_CONFIRM
+      [[ "$ADOPT_CONFIRM" == 'RECOVER ADOPT' ]] || exit 0
+    else
+      PANEL_ACTION=adopt_existing
+      [[ "$ACTION" != adopt-preflight ]] || PANEL_ACTION=adopt_preflight
+      [[ ${#ADOPT_BINDINGS[@]} -gt 0 ]] || fail 'Укажите --adopt-sni ID=ДОМЕН для каждого существующего inbound.'
+      PARALLEL_MAP=$(mktemp /tmp/selfsteal-adopt.XXXXXXXX)
+      chmod 600 "$PARALLEL_MAP"
+      python3 - "$PARALLEL_MAP" "${ADOPT_BINDINGS[@]}" <<'PY'
+import json,re,sys
+records={}
+for spec in sys.argv[2:]:
+    if '=' not in spec: sys.exit('Ожидается ID=ДОМЕН')
+    ident,domain=spec.split('=',1)
+    if not re.fullmatch(r'[1-9][0-9]*',ident) or ident in records:
+        sys.exit('Неверный или повторный ID inbound')
+    records[ident]=domain
+with open(sys.argv[1],'w') as f: json.dump(records,f)
+PY
+      HELPER_ARGS=(--sni-map "$PARALLEL_MAP")
+      if [[ "$ACTION" == adopt-existing ]]; then
+        echo 'Будут настроены только указанные существующие inbound; UUID и ключи Reality останутся прежними.'
+        read -r -p 'Для подтверждения изменений введите ADOPT EXISTING: ' ADOPT_CONFIRM
+        [[ "$ADOPT_CONFIRM" == 'ADOPT EXISTING' ]] || { rm -f "$PARALLEL_MAP"; exit 0; }
+      fi
+    fi
+  fi
   if [[ "$ACTION" == parallel-reality || "$ACTION" == parallel-preflight || "$ACTION" == recover-parallel ]]; then
     PANEL_ACTION=migrate_parallel
     [[ "$ACTION" != parallel-preflight ]] || PANEL_ACTION=parallel_preflight
@@ -4837,7 +5103,7 @@ PY
   emit_panel_helper > "$PANEL_HELPER"
   if [[ "$ACTION" == add-inbound ]]; then HELPER_ARGS+=(--port "$ADD_PORT"); fi
   if [[ "$ACTION" == add-hysteria ]]; then HELPER_ARGS=(--port "$ADD_PORT" --domain "$HYSTERIA_DOMAIN" --salamander "$HYSTERIA_SALAMANDER"); fi
-  if [[ "$ACTION" == parallel-reality || "$ACTION" == recover-parallel ]] || \
+  if [[ "$ACTION" == parallel-reality || "$ACTION" == recover-parallel || "$ACTION" == adopt-existing || "$ACTION" == recover-adopt ]] || \
      { [[ "$ACTION" == add-inbound ]] && python3 - "$STATE" <<'PY'
 import json,sys
 sys.exit(0 if json.load(open(sys.argv[1])).get('reality_mode') == 'parallel' else 1)
@@ -4847,7 +5113,7 @@ PY
   fi
   if helper "$PANEL_ACTION" "${HELPER_ARGS[@]}"; then
     [[ -z "$PARALLEL_MAP" ]] || rm -f "$PARALLEL_MAP"
-    if [[ "$ACTION" == parallel-preflight ]]; then SUCCESS=1; exit 0; fi
+    if [[ "$ACTION" == parallel-preflight || "$ACTION" == adopt-preflight ]]; then SUCCESS=1; exit 0; fi
     persist_tmp="/root/selfsteal-3xui/state.json.tmp.$$"
     install -m 600 "$STATE" "$persist_tmp"
     mv -f -- "$persist_tmp" /root/selfsteal-3xui/state.json
@@ -4860,7 +5126,7 @@ PY
 import json,sys
 try: state=json.load(open(sys.argv[1]))
 except Exception: sys.exit(1)
-sys.exit(0 if state.get('pending_parallel') or state.get('pending_add_inbound',{}).get('rollback_incomplete') or state.get('pending_chain') or state.get('pending_hysteria',{}).get('rollback_incomplete') else 1)
+sys.exit(0 if state.get('pending_parallel') or state.get('pending_adopt') or state.get('pending_add_inbound',{}).get('rollback_incomplete') or state.get('pending_chain') or state.get('pending_hysteria',{}).get('rollback_incomplete') else 1)
 PY
     then
       persist_tmp="/root/selfsteal-3xui/state.json.tmp.$$"
