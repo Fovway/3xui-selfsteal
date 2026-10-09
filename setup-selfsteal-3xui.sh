@@ -1660,6 +1660,9 @@ managed=[
     snippet,
     map_conf,
     pathlib.Path('/etc/nginx/conf.d/selfsteal-3xui-default.conf'),
+    pathlib.Path('/etc/nginx/modules-enabled/99-selfsteal-3xui-stream.conf'),
+    pathlib.Path('/etc/nginx/conf.d/99-selfsteal-3xui-parallel-tls.conf'),
+    pathlib.Path('/etc/nginx/sites-enabled/99-selfsteal-3xui-parallel-acme.conf'),
     pathlib.Path('/etc/letsencrypt/renewal-hooks/deploy/selfsteal-3xui-nginx'),
     pathlib.Path('/etc/fail2ban/jail.d/selfsteal-3xui.conf'),
     pathlib.Path('/etc/systemd/system/x-ui.service'),
@@ -3375,6 +3378,13 @@ def checked_uri(api, state, inbound):
 
 def verify(state):
     require_version(state)
+    if state.get('reality_mode') == 'parallel':
+        api = API(state)
+        records = parallel_existing_rows(state, api)
+        parallel_runtime(state, records)
+        parallel_probe_443(records)
+        checked_uri(api, state, records[0]['before'])
+        return api, records[0]['before']
     api = API(state)
     inbound = pick(api.list())
     if not inbound or inbound['id'] != state.get('inbound_id'):
@@ -3945,7 +3955,7 @@ def parallel_existing_rows(state, api):
                 or row.get('listen') != '127.0.0.1'
                 or parse(row.get('streamSettings') or {}).get('realitySettings', {}).get('serverNames') != [sni]):
             raise RuntimeError('Независимый Reality изменён вне скрипта: inbound ' + str(rid))
-        records.append({'id': rid, 'sni': sni, 'port': port, 'before': row})
+        records.append({'id': rid, 'sni': sni, 'port': port, 'before': row, 'after': row})
     if len(records) != len(mapping) or len({r['sni'] for r in records}) != len(records):
         raise RuntimeError('Состояние SNI расходится с текущим списком inbound')
     expected_files, _ = parallel_texts(state, records)
@@ -4345,6 +4355,14 @@ PY
   if [[ "$ACTION" == add-inbound ]]; then
     PANEL_ACTION=add_inbound
     read -r -p 'Локальный TCP-порт нового inbound: ' ADD_PORT
+    if [[ $(python3 - "$state_file" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1])).get('reality_mode','chain'))
+PY
+) == parallel ]]; then
+      read -r -p 'Новый уникальный домен/SNI, DNS на этот сервер: ' PARALLEL_ADD_SNI
+      HELPER_ARGS=(--sni "$PARALLEL_ADD_SNI")
+    fi
     [[ "$ADD_PORT" =~ ^[0-9]{1,5}$ ]] || fail 'Введите целый номер TCP-порта от 1 до 65535.'
   fi
   ADD_PORT=$(python3 - "$state_file" "$STATE" "$ADD_PORT" "$ACTION" <<'PY'
@@ -4365,7 +4383,7 @@ print(port)
 PY
 ) || fail 'Не удалось проверить сохранённое состояние или номер порта.'
   emit_panel_helper > "$PANEL_HELPER"
-  if [[ "$ACTION" == add-inbound ]]; then HELPER_ARGS=(--port "$ADD_PORT"); fi
+  if [[ "$ACTION" == add-inbound ]]; then HELPER_ARGS+=(--port "$ADD_PORT"); fi
   if [[ "$ACTION" == add-hysteria ]]; then HELPER_ARGS=(--port "$ADD_PORT" --domain "$HYSTERIA_DOMAIN" --salamander "$HYSTERIA_SALAMANDER"); fi
   if helper "$PANEL_ACTION" "${HELPER_ARGS[@]}"; then
     [[ -z "$PARALLEL_MAP" ]] || rm -f "$PARALLEL_MAP"
