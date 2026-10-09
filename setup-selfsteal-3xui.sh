@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.09.7
+SCRIPT_VERSION=2026.10.09.8
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/feature/parallel-reality-sni/setup-selfsteal-3xui.sh
@@ -3971,12 +3971,27 @@ def parallel_probe_443(records):
             raise RuntimeError('Локальный HTTPS fallback недоступен для ' + r['sni']) from exc
 
 
+# Fields supported by entity.HostGroup in the pinned 3x-ui 3.8.5 API.
+# Keep all subscription options when updating an existing host group.
+PARALLEL_HOST_FIELDS = (
+    'groupId', 'inboundIds', 'sortOrder', 'remark', 'serverDescription',
+    'hosts', 'port', 'security', 'sni', 'hostHeader', 'path', 'alpn',
+    'isDisabled', 'isHidden', 'tags', 'fingerprint',
+    'overrideSniFromAddress', 'keepSniBlank', 'pinnedPeerCertSha256',
+    'verifyPeerCertByName', 'allowInsecure', 'echConfigList',
+    'muxParams', 'sockoptParams', 'finalMask', 'vlessRoute',
+    'excludeFromSubTypes', 'nodeGuids', 'mihomoIpVersion',
+    'mihomoX25519', 'shuffleHost')
+
+
+def parallel_host_payload_restore(group):
+    return {key: copy.deepcopy(group[key]) for key in PARALLEL_HOST_FIELDS
+            if key in group}
+
+
 def parallel_host_payload(row, inbound_id, sni):
-    # Existing groupId remains unchanged with the documented update API.
-    fields = ('inboundIds', 'remark', 'hosts', 'port', 'security', 'sni',
-              'hostHeader', 'path', 'alpn', 'isDisabled', 'isHidden', 'tags')
     if row:
-        result = {key: copy.deepcopy(row[key]) for key in fields if key in row}
+        result = parallel_host_payload_restore(row)
     else:
         result = dict(remark='selfsteal-parallel-443', alpn=[], tags=[],
                       isDisabled=False, isHidden=False, security='same')
@@ -3992,21 +4007,49 @@ def parallel_host_group(api, inbound_id, groups):
     return found[0] if found else None
 
 
+def parallel_host_confirm(inbound_id, sni, group):
+    """3x-ui list returns the host with :443 appended, unlike add payload."""
+    if (not group or not group.get('groupId')
+            or group.get('inboundIds') != [int(inbound_id)]
+            or not host_group_has_address(group, sni, port=443)
+            or int(group.get('port') or 0) != 443
+            or group.get('sni') != sni):
+        raise RuntimeError('Группа hosts для inbound ID %d (SNI %s) не подтверждена '
+                           'после изменения через API' % (inbound_id, sni))
+    return str(group['groupId'])
+
+
 def parallel_hosts_apply(api, records, old_groups):
     created = []
     for r in records:
-        prior = parallel_host_group(api, int(r['id']), old_groups)
-        payload_value = parallel_host_payload(prior, r['id'], r['sni'])
-        if prior and prior.get('groupId'):
+        inbound_id = int(r['id'])
+        prior = parallel_host_group(api, inbound_id, old_groups)
+        payload_value = parallel_host_payload(prior, inbound_id, r['sni'])
+        if prior:
+            if not prior.get('groupId'):
+                raise RuntimeError('Существующая группа hosts без groupId для inbound ID %d' %
+                                   inbound_id)
             api.call('panel/api/hosts/update/' + str(prior['groupId']), payload_value)
         else:
+            # Add returns Host database rows, while GET /hosts/list returns
+            # grouped HostGroup values with "sni:443" host addresses.
             api.call('panel/api/hosts/add', payload_value)
-            updated = api.call('panel/api/hosts/list') or []
-            found = [g for g in updated if g.get('inboundIds') == [int(r['id'])]
-                     and g.get('hosts') == [r['sni']]]
-            if len(found) != 1 or not found[0].get('groupId'):
-                raise RuntimeError('Не удалось подтвердить созданную группу hosts')
-            created.append(str(found[0]['groupId']))
+        updated = api.call('panel/api/hosts/list') or []
+        current = parallel_host_group(api, inbound_id, updated)
+        group_id = parallel_host_confirm(inbound_id, r['sni'], current)
+        if prior and group_id != str(prior['groupId']):
+            raise RuntimeError('3x-ui сменила ID существующей группы hosts')
+        if prior:
+            # The API update replaces every row in the group; never silently
+            # lose fingerprint/ALPN/visibility/billing subscription settings.
+            unchanged = set(PARALLEL_HOST_FIELDS) - {
+                'hosts', 'port', 'security', 'sni'}
+            for field in unchanged:
+                if field in prior and current.get(field) != prior[field]:
+                    raise RuntimeError('Параметр hosts %s изменился в inbound ID %d' %
+                                       (field, inbound_id))
+        else:
+            created.append(group_id)
     return created
 
 
@@ -4017,21 +4060,17 @@ def parallel_hosts_restore(api, records, originals):
         current = parallel_host_group(api, int(r['id']), now)
         if (before and current and before.get('groupId') == current.get('groupId')
                 and parallel_host_payload_restore(before) == parallel_host_payload_restore(current)):
-            continue  # Nothing changed in this transaction: leave subscriptions alone.
+            continue
         if before and current and before.get('groupId') == current.get('groupId'):
             api.call('panel/api/hosts/update/' + str(before['groupId']),
                      parallel_host_payload_restore(before))
         elif before and not current:
+            # Preserve original group ID when restoring an absent group.
             api.call('panel/api/hosts/add', parallel_host_payload_restore(before))
         elif not before and current and current.get('groupId'):
             api.call('panel/api/hosts/bulk/del', {'ids': [str(current['groupId'])]})
-
-
-def parallel_host_payload_restore(group):
-    allowed = ('inboundIds', 'remark', 'hosts', 'port', 'security', 'sni',
-               'hostHeader', 'path', 'alpn', 'isDisabled', 'isHidden', 'tags')
-    return {key: copy.deepcopy(group[key]) for key in allowed if key in group}
-
+        elif before or current:
+            raise RuntimeError('Группа hosts изменила ID или состав: нужен ручной откат')
 
 def parallel_rollback_inbound(before, current, expected=None):
     """Undo only migration-owned fields, retaining billing-created users/UUIDs.
@@ -4430,7 +4469,7 @@ def parallel_add_inbound(state, port, sni, save):
         api.call('panel/api/hosts/add', parallel_host_payload(None, created_id, sni))
         groups = api.call('panel/api/hosts/list') or []
         matching = [g for g in groups if g.get('inboundIds') == [created_id]
-                    and g.get('hosts') == [sni]]
+                    and host_group_has_address(g, sni, port=443)]
         if len(matching) != 1 or not matching[0].get('groupId'):
             raise RuntimeError('Новая группа подписки не подтверждена')
         host_id = str(matching[0]['groupId'])
@@ -4460,7 +4499,7 @@ def parallel_add_inbound(state, port, sni, save):
                 # Remove only the group belonging to this operation.
                 ids = [str(g['groupId']) for g in groups
                        if g.get('inboundIds') == [created_id]
-                       and g.get('hosts') == [sni]
+                       and host_group_has_address(g, sni, port=443)
                        and g.get('groupId')]
                 if ids:
                     api.call('panel/api/hosts/bulk/del', {'ids': ids})
