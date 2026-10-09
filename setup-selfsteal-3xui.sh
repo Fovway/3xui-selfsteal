@@ -17,14 +17,15 @@ ACTION='menu'
 while (( $# )); do
   case $1 in
     --help|-h) cat <<'HELP'
-Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access|--tests|--add-hysteria|--masking-audit]
+Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--parallel-reality|--recover-parallel|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access|--tests|--add-hysteria|--masking-audit]
 Без аргументов открывается главное меню. При первом запуске меню устанавливается команда selfsteal.
 --install-script устанавливает текущую копию скрипта как /usr/local/bin/selfsteal.
 --update-script обновляет команду selfsteal из main на GitHub после проверки синтаксиса.
 --uninstall-script удаляет только команду selfsteal, сохраняя настройку сервера.
 --install запускает установку/настройку.
 --add-inbound добавляет VLESS + Reality inbound, привязывает его к выбранному существующему пользователю и создаёт запись panel/hosts для сохранённого домена:443.
---repair-chain связывает уже созданные скриптом inbound в цепочку 443 -> дополнительные порты -> nginx и устанавливает fingerprint firefox.
+--repair-chain восстанавливает прежнюю последовательную Reality-цепочку (только для старого режима).
+28 --parallel-reality преобразует имеющуюся Reality-цепочку в независимые inbound за nginx:443 по разным SNI с автоматическим откатом.
 --uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
 --status показывает состояние по пунктам без изменений.
 --masking-audit проверяет маскировку Reality/TLS/HTTPS/Hysteria и закрытость панели, не изменяя конфигурацию.
@@ -49,6 +50,8 @@ HELP
     --add-inbound) ACTION=add-inbound; shift ;;
     --add-hysteria) ACTION=add-hysteria; shift ;;
     --repair-chain) ACTION=repair-chain; shift ;;
+    --parallel-reality) ACTION=parallel-reality; shift ;;
+    --recover-parallel) ACTION=recover-parallel; shift ;;
     --uninstall|--remove) ACTION=uninstall; shift ;;
     --panel-access) ACTION=panel-access; shift ;;
     --tests) ACTION=vps-tests; shift ;;
@@ -1187,7 +1190,7 @@ show_submenu() {
         printf '    3) ✅ Проверить состояние 3x-ui\n'
         printf '    4) 🛡️ Аудит маскировки сервера\n'
         printf '\n    0) ↩️ Назад в главное меню\n\n'
-        printf '%sВыберите пункт [0–4]: %s' "$cyan" "$reset"
+        printf '%sВыберите пункт [0–5]: %s' "$cyan" "$reset"
         ;;
       selfsteal)
         printf '\n%s  🌐 Настройка Self-Steal%s\n' "$cyan" "$reset"
@@ -1196,6 +1199,7 @@ show_submenu() {
         printf '    2) ➕ Создать новый inbound (VLESS / Hysteria 2)\n'
         printf '    3) 🔗 Исправить цепочку inbound\n'
         printf '    4) ✅ Проверить конфигурацию\n'
+        printf '    5) 🔀 Независимые Reality через nginx / восстановление\n'
         printf '\n    0) ↩️ Назад в главное меню\n\n'
         printf '%sВыберите пункт [0–4]: %s' "$cyan" "$reset"
         ;;
@@ -4106,7 +4110,7 @@ PY
   exit 0
 fi
 
-if [[ "$ACTION" == add-inbound || "$ACTION" == add-hysteria || "$ACTION" == repair-chain ]]; then
+if [[ "$ACTION" == add-inbound || "$ACTION" == add-hysteria || "$ACTION" == repair-chain || "$ACTION" == parallel-reality || "$ACTION" == recover-parallel ]]; then
   echo
   echo '==============================================='
   echo '        3xUI Self-Steal — создание inbound'
@@ -4146,6 +4150,8 @@ PY
   ADD_PORT=$(python3 - "$state_file" "$STATE" "$ADD_PORT" "$ACTION" <<'PY'
 import json,os,re,sys
 source,destination,raw,action=sys.argv[1:]
+if action not in ('add-inbound','add-hysteria'):
+    raw='0'
 if not re.fullmatch(r'[0-9]{1,5}',raw): sys.exit('Некорректный номер порта.')
 port=int(raw)
 if action in ('add-inbound','add-hysteria') and not 1 <= port <= 65535: sys.exit('Порт должен быть от 1 до 65535.')
