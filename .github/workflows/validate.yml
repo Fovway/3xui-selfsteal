@@ -52,6 +52,9 @@ jobs:
       - name: Test test_parallel_autotag.py
         if: always()
         run: python3 -m unittest discover -s tests -p 'test_parallel_autotag.py' -v
+      - name: Test test_parallel_http_bind.py
+        if: always()
+        run: python3 -m unittest discover -s tests -p 'test_parallel_http_bind.py' -v
       - name: Test test_parallel_host_groups.py
         if: always()
         run: python3 -m unittest discover -s tests -p 'test_parallel_host_groups.py' -v
