@@ -1232,6 +1232,7 @@ show_submenu() {
       selfsteal:2) show_inbound_type_menu; [[ "$ACTION" == menu ]] || return 0 ;;
       selfsteal:3) ACTION=repair-chain; return 0 ;;
       selfsteal:4) ACTION=status; return 0 ;;
+      selfsteal:5) ACTION=parallel-reality; return 0 ;;
       service:1) show_github_update_status; menu_pause ;;
       service:2) ACTION=update-script; return 0 ;;
       removal:1) ACTION=uninstall; return 0 ;;
@@ -4122,6 +4123,37 @@ if [[ "$ACTION" == add-inbound || "$ACTION" == add-hysteria || "$ACTION" == repa
   ADD_PORT=0
   HYSTERIA_DOMAIN=''
   HYSTERIA_SALAMANDER=on
+  PARALLEL_MAP=''
+  if [[ "$ACTION" == parallel-reality || "$ACTION" == recover-parallel ]]; then
+    PANEL_ACTION=migrate_parallel
+    if [[ "$ACTION" == recover-parallel ]]; then
+      PANEL_ACTION=recover_parallel
+      echo 'Будет восстановлена конфигурация до незавершённой миграции.'
+      read -r -p 'Для подтверждения введите RECOVER: ' PARALLEL_CONFIRM
+      [[ "$PARALLEL_CONFIRM" == RECOVER ]] || exit 0
+    else
+      echo 'Независимые Reality на TCP 443: каждый дополнительный inbound получит отдельный SNI.'
+      echo 'Основной домен сохраняется. Клиентам дополнительных inbound потребуется обновить ссылку.'
+      read -r -p 'Подготовить безопасную миграцию? [y/N]: ' PARALLEL_OK
+      [[ "${PARALLEL_OK,,}" == y ]] || exit 0
+      PARALLEL_MAP=$(mktemp /tmp/selfsteal-sni.XXXXXXXX)
+      chmod 600 "$PARALLEL_MAP"
+      python3 - "$state_file" "$PARALLEL_MAP" <<'PY'
+import json,sys
+state=json.load(open(sys.argv[1]))
+m={}
+for row in state.get('added_inbounds') or []:
+    ident=str(row['id'])
+    if ident in m: sys.exit('Повторяется ID inbound')
+    print('Inbound ID %s, прежний внутренний TCP-порт %d:' % (ident,row['port']))
+    m[ident]=input('  Уникальный домен/SNI (DNS на тот же сервер): ').strip()
+with open(sys.argv[2],'w') as f: json.dump(m,f)
+PY
+      read -r -p 'Для изменения работающего nginx и Xray введите PARALLEL REALITY: ' PARALLEL_CONFIRM
+      [[ "$PARALLEL_CONFIRM" == 'PARALLEL REALITY' ]] || { rm -f "$PARALLEL_MAP"; exit 0; }
+      HELPER_ARGS=(--sni-map "$PARALLEL_MAP")
+    fi
+  fi
   if [[ "$ACTION" == add-hysteria ]]; then
     PANEL_ACTION=add_hysteria
     read -r -p 'Домен Hysteria 2 (Enter — домен Self-Steal): ' HYSTERIA_DOMAIN
@@ -4168,6 +4200,7 @@ PY
   if [[ "$ACTION" == add-inbound ]]; then HELPER_ARGS=(--port "$ADD_PORT"); fi
   if [[ "$ACTION" == add-hysteria ]]; then HELPER_ARGS=(--port "$ADD_PORT" --domain "$HYSTERIA_DOMAIN" --salamander "$HYSTERIA_SALAMANDER"); fi
   if helper "$PANEL_ACTION" "${HELPER_ARGS[@]}"; then
+    [[ -z "$PARALLEL_MAP" ]] || rm -f "$PARALLEL_MAP"
     persist_tmp="/root/selfsteal-3xui/state.json.tmp.$$"
     install -m 600 "$STATE" "$persist_tmp"
     mv -f -- "$persist_tmp" /root/selfsteal-3xui/state.json
@@ -4175,11 +4208,12 @@ PY
     exit 0
   else
     rc=$?
+    [[ -z "$PARALLEL_MAP" ]] || rm -f "$PARALLEL_MAP"
     if python3 - "$STATE" <<'PY'
 import json,sys
 try: state=json.load(open(sys.argv[1]))
 except Exception: sys.exit(1)
-sys.exit(0 if state.get('pending_add_inbound',{}).get('rollback_incomplete') or state.get('pending_chain') or state.get('pending_hysteria',{}).get('rollback_incomplete') else 1)
+sys.exit(0 if state.get('pending_parallel') or state.get('pending_add_inbound',{}).get('rollback_incomplete') or state.get('pending_chain') or state.get('pending_hysteria',{}).get('rollback_incomplete') else 1)
 PY
     then
       persist_tmp="/root/selfsteal-3xui/state.json.tmp.$$"
