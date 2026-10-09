@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.08.3
+SCRIPT_VERSION=2026.10.09.1
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -17,7 +17,7 @@ ACTION='menu'
 while (( $# )); do
   case $1 in
     --help|-h) cat <<'HELP'
-Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access|--tests]
+Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access|--tests|--add-hysteria]
 Без аргументов открывается главное меню. При первом запуске меню устанавливается команда selfsteal.
 --install-script устанавливает текущую копию скрипта как /usr/local/bin/selfsteal.
 --update-script обновляет команду selfsteal из main на GitHub после проверки синтаксиса.
@@ -28,6 +28,7 @@ while (( $# )); do
 --uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
 --status показывает состояние по пунктам без изменений.
 --panel-access открывает переключатель публичного HTTPS-доступа к панели.
+--add-hysteria добавляет Hysteria 2 на отдельном UDP-порту с TLS и Salamander, не меняя TCP Reality.
 --tests открывает меню внешних тестов VPS.
 --version показывает версию скрипта.
 --check выполняет предварительную проверку системы, DNS и конфликтов без изменений и запроса учетных данных.
@@ -45,6 +46,7 @@ HELP
     --update-script) ACTION=update-script; shift ;;
     --install) ACTION=install; shift ;;
     --add-inbound) ACTION=add-inbound; shift ;;
+    --add-hysteria) ACTION=add-hysteria; shift ;;
     --repair-chain) ACTION=repair-chain; shift ;;
     --uninstall|--remove) ACTION=uninstall; shift ;;
     --panel-access) ACTION=panel-access; shift ;;
@@ -766,6 +768,25 @@ show_github_update_status() {
   fi
 }
 
+show_inbound_type_menu() {
+  local choice
+  while :; do
+    printf '\n  ➕ Создать новый inbound\n'
+    printf '────────────────────────────────────────────────────────────────\n'
+    printf '    1) VLESS + Reality (TCP, существующая цепочка)\n'
+    printf '    2) Hysteria 2 (UDP, TLS, Salamander)\n'
+    printf '\n    0) ↩️ Назад\n\n'
+    printf 'Выберите протокол [0–2]: '
+    read -r choice || return 0
+    case "$choice" in
+      1) ACTION=add-inbound; return 0 ;;
+      2) ACTION=add-hysteria; return 0 ;;
+      0) return 0 ;;
+      *) echo 'Введите 0, 1 или 2.' ;;
+    esac
+  done
+}
+
 show_submenu() {
   local section=$1 choice
   while :; do
@@ -783,7 +804,7 @@ show_submenu() {
         printf '\n%s  🌐 Настройка Self-Steal%s\n' "$cyan" "$reset"
         printf '%s────────────────────────────────────────────────────────────────%s\n' "$dim" "$reset"
         printf '    1) 🛠️ Установить\n'
-        printf '    2) ➕ Создать новый inbound\n'
+        printf '    2) ➕ Создать новый inbound (VLESS / Hysteria 2)\n'
         printf '    3) 🔗 Исправить цепочку inbound\n'
         printf '    4) ✅ Проверить конфигурацию\n'
         printf '\n    0) ↩️ Назад в главное меню\n\n'
@@ -814,7 +835,7 @@ show_submenu() {
       xui:2) ACTION=panel-access; return 0 ;;
       xui:3) show_xui_status; menu_pause ;;
       selfsteal:1) ACTION=install; return 0 ;;
-      selfsteal:2) ACTION=add-inbound; return 0 ;;
+      selfsteal:2) show_inbound_type_menu; [[ "$ACTION" == menu ]] || return 0 ;;
       selfsteal:3) ACTION=repair-chain; return 0 ;;
       selfsteal:4) ACTION=status; return 0 ;;
       service:1) show_github_update_status; menu_pause ;;
@@ -3204,16 +3225,38 @@ PY
   exit 0
 fi
 
-if [[ "$ACTION" == add-inbound || "$ACTION" == repair-chain ]]; then
+if [[ "$ACTION" == add-inbound || "$ACTION" == add-hysteria || "$ACTION" == repair-chain ]]; then
   echo
   echo '==============================================='
-  echo '        3xUI Self-Steal — цепочка Reality'
+  echo '        3xUI Self-Steal — создание inbound'
   echo '==============================================='
   state_file=$(load_install_state || true)
   [[ -n "$state_file" && -r "$state_file" ]] || fail 'Нет сохранённой активной установки с данными панели. Сначала выполните установку.'
   HELPER_ARGS=()
   PANEL_ACTION=repair_chain
   ADD_PORT=0
+  HYSTERIA_DOMAIN=''
+  HYSTERIA_SALAMANDER=on
+  if [[ "$ACTION" == add-hysteria ]]; then
+    PANEL_ACTION=add_hysteria
+    read -r -p 'Домен Hysteria 2 (Enter — домен Self-Steal): ' HYSTERIA_DOMAIN
+    if [[ -z "$HYSTERIA_DOMAIN" ]]; then
+      HYSTERIA_DOMAIN=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1])).get('domain',''))
+PY
+)
+    fi
+    HYSTERIA_DOMAIN=${HYSTERIA_DOMAIN,,}
+    read -r -p 'UDP-порт Hysteria 2 [443]: ' ADD_PORT
+    ADD_PORT=${ADD_PORT:-443}
+    read -r -p 'Включить Salamander? [Y/n]: ' MASK_CHOICE
+    case "${MASK_CHOICE,,}" in
+      ''|y|yes|д|да) HYSTERIA_SALAMANDER=on ;;
+      n|no|н|нет) HYSTERIA_SALAMANDER=off ;;
+      *) fail 'Ответьте Y или n.' ;;
+    esac
+  fi
   if [[ "$ACTION" == add-inbound ]]; then
     PANEL_ACTION=add_inbound
     read -r -p 'Локальный TCP-порт нового inbound: ' ADD_PORT
@@ -3224,7 +3267,7 @@ import json,os,re,sys
 source,destination,raw,action=sys.argv[1:]
 if not re.fullmatch(r'[0-9]{1,5}',raw): sys.exit('Некорректный номер порта.')
 port=int(raw)
-if action=='add-inbound' and not 1 <= port <= 65535: sys.exit('Порт должен быть от 1 до 65535.')
+if action in ('add-inbound','add-hysteria') and not 1 <= port <= 65535: sys.exit('Порт должен быть от 1 до 65535.')
 with open(source) as f: state=json.load(f)
 if state.get('removed'): sys.exit('Сохранённая установка помечена как удалённая; сначала выполните установку снова.')
 required=('domain','panel_url','panel_username','panel_password','inbound_id')
@@ -3236,6 +3279,7 @@ PY
 ) || fail 'Не удалось проверить сохранённое состояние или номер порта.'
   emit_panel_helper > "$PANEL_HELPER"
   if [[ "$ACTION" == add-inbound ]]; then HELPER_ARGS=(--port "$ADD_PORT"); fi
+  if [[ "$ACTION" == add-hysteria ]]; then HELPER_ARGS=(--port "$ADD_PORT" --domain "$HYSTERIA_DOMAIN" --salamander "$HYSTERIA_SALAMANDER"); fi
   if helper "$PANEL_ACTION" "${HELPER_ARGS[@]}"; then
     persist_tmp="/root/selfsteal-3xui/state.json.tmp.$$"
     install -m 600 "$STATE" "$persist_tmp"
@@ -3248,7 +3292,7 @@ PY
 import json,sys
 try: state=json.load(open(sys.argv[1]))
 except Exception: sys.exit(1)
-sys.exit(0 if state.get('pending_add_inbound',{}).get('rollback_incomplete') or state.get('pending_chain') else 1)
+sys.exit(0 if state.get('pending_add_inbound',{}).get('rollback_incomplete') or state.get('pending_chain') or state.get('pending_hysteria',{}).get('rollback_incomplete') else 1)
 PY
     then
       persist_tmp="/root/selfsteal-3xui/state.json.tmp.$$"
