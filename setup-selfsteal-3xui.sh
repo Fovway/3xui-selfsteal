@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.09.12
+SCRIPT_VERSION=2026.10.09.13
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/feature/parallel-reality-sni/setup-selfsteal-3xui.sh
@@ -3675,6 +3675,51 @@ def parallel_pick_port(existing):
     raise RuntimeError('Нет свободного внутреннего TCP-порта для первого Reality')
 
 
+def parallel_http_listens(state):
+    """Match the primary HTTP listener instead of introducing a wildcard :80.
+
+    nginx -t accepts overlapping IPv4 socket definitions, while the master
+    can fail to apply the reload with EADDRINUSE. In particular a primary site
+    bound to PUBLIC_IP:80 must not be accompanied by listen 0.0.0.0:80.
+    """
+    site_name = state.get('nginx_site')
+    if not site_name:
+        # Kept for the initial configuration generator and isolated unit tests.
+        return ('    listen 80;\n    listen [::]:80;\n')
+    path = Path(site_name)
+    if not path.is_file():
+        raise RuntimeError('Не найден исходный HTTP-сайт nginx: ' + str(path))
+    try:
+        source = path.read_text()
+    except OSError:
+        raise RuntimeError('Не удалось прочитать исходный HTTP-сайт nginx') from None
+
+    # Use exactly the same IPv4 binding as the site's existing HTTP vhost.
+    # Some installations put both the default return-444 and named server
+    # on a specific public address rather than on the IPv4 wildcard.
+    ips = set()
+    for candidate in re.findall(r'\blisten\s+([0-9.]+):80(?=[\s;])', source):
+        try:
+            ip = ipaddress.IPv4Address(candidate)
+        except ipaddress.AddressValueError:
+            continue
+        if not ip.is_unspecified:
+            ips.add(str(ip))
+    if len(ips) > 1:
+        raise RuntimeError('Исходный nginx слушает несколько IPv4 на TCP 80; '
+                           'нельзя безопасно выбрать адрес для ACME')
+    if ips:
+        ipv4_line = '    listen ' + next(iter(ips)) + ':80;\n'
+    elif re.search(r'\blisten\s+(?:0\.0\.0\.0:)?80(?=[\s;])', source):
+        ipv4_line = '    listen 80;\n'
+    else:
+        raise RuntimeError('Не удалось найти исходный IPv4 HTTP-listener на TCP 80 '
+                           'в ' + str(path))
+    # Do not open IPv6 port 80 if the primary site itself did not bind IPv6.
+    has_ipv6 = bool(re.search(r'\blisten\s+\[::\]:80(?=[\s;])', source))
+    return ipv4_line + ('    listen [::]:80;\n' if has_ipv6 else '')
+
+
 def parallel_texts(state, records):
     main = parallel_validate_sni(state['domain'])
     root = Path('/var/www/selfsteal-3xui-' + main)
@@ -3702,6 +3747,7 @@ def parallel_texts(state, records):
               '}\n')
     tls = PARALLEL_HEADER
     acme = PARALLEL_HEADER
+    acme_listens = parallel_http_listens(state) if extras else ''
     for r in extras:
         name = r['sni']
         # Adopted inbounds get an isolated loopback TLS endpoint. The original
@@ -3724,9 +3770,8 @@ def parallel_texts(state, records):
             '}\n')
         acme += (
             'server {\n'
-            '    listen 80;\n'
-            '    listen [::]:80;\n'
-            '    server_name ' + name + ';\n'
+            + acme_listens
+            + '    server_name ' + name + ';\n'
             '    location ^~ /.well-known/acme-challenge/ { root ' + str(root) + '; }\n'
             '    location / { return 301 https://$host$request_uri; }\n'
             '}\n')
