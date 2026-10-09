@@ -87,21 +87,27 @@ class ParallelTests(unittest.TestCase):
     def test_runtime_must_bind_loopback_not_public_ip(self):
         import json
         state = dict(self.state, panel_binary='/usr/local/x-ui/x-ui')
-        row = dict(tag='selfsteal-reality-10443', protocol='vless', port=10443,
-                   listen='0.0.0.0',
-                   streamSettings={'security': 'reality', 'tcpSettings': {'acceptProxyProtocol': True},
-                                   'realitySettings': {'privateKey': 'secret', 'shortIds': ['aa'],
-                                                      'serverNames': ['main.example.com'],
-                                                      'target': '127.0.0.1:9443'}})
-        before = dict(row, listen='127.0.0.1',
-                      streamSettings=json.dumps(row['streamSettings']))
+        settings = {'security': 'reality',
+                    'tcpSettings': {'acceptProxyProtocol': True},
+                    'realitySettings': {'privateKey': 'secret', 'shortIds': ['aa'],
+                                        'serverNames': ['main.example.com'],
+                                        'target': '127.0.0.1:9443', 'xver': 1}}
+        row = dict(id=12, tag='selfsteal-reality-10443', protocol='vless',
+                   port=10443, listen='127.0.0.1',
+                   settings=json.dumps({'clients': []}),
+                   streamSettings=json.dumps(settings))
         records = [{'id': 12, 'port': 10443, 'sni': 'main.example.com',
-                    'before': before, 'after': before}]
-        runtime = json.dumps({'inbounds': [row]})
-        with patch.object(helper.Path, 'read_text', return_value=runtime), \
+                    'before': row, 'after': row}]
+        bad_socket = 'LISTEN 0 4096 0.0.0.0:10443 0.0.0.0:* users:(("xray-linux-amd64",pid=25,fd=7))'
+        class Completed:
+            stdout = bad_socket
+        class FakeApi:
+            def list(self):
+                return [row]
+        with patch.object(helper.subprocess, 'run', return_value=Completed()), \
                 patch.object(helper.time, 'sleep'):
-            with self.assertRaisesRegex(RuntimeError, 'не подтвердил'):
-                helper.parallel_runtime(state, records)
+            with self.assertRaisesRegex(RuntimeError, '0.0.0.0'):
+                helper.parallel_runtime(state, records, FakeApi())
 
     def test_recovery_rejects_untrusted_backup_path(self):
         state = {'pending_parallel': {'backup': '/tmp/user-controlled'}}

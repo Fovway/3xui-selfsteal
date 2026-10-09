@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.09.5
+SCRIPT_VERSION=2026.10.09.6
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/feature/parallel-reality-sni/setup-selfsteal-3xui.sh
@@ -2755,7 +2755,7 @@ def chain_plan(api, state, extra=None):
                 or reality.get('serverNames') != [state['domain']]):
             raise RuntimeError('Inbound ID %s не соответствует сохранённой локальной настройке Reality' % record['id'])
         if before.get('listen') not in ('', None, '0.0.0.0', '127.0.0.1', '::', '::0'):
-            raise RuntimeError('Inbound цепочки недоступен через loopback; проверьте поле listen')
+            raise RuntimeError('Inbound ID %s (TCP %d): listen=%s не принимает подключение через 127.0.0.1; цепочка не изменена. Не меняйте listen без проверки маршрута и текущих клиентов.' % (before['id'], int(before['port']), before['listen']))
         if any(key == reality['privateKey'] and set(short_ids) & set(reality['shortIds'])
                for key, short_ids in credentials):
             raise RuntimeError('У двух inbound совпадают Reality-ключ и Short ID; цепочка не сможет различать их')
@@ -3800,34 +3800,105 @@ def parallel_ensure_certs(state, records, texts, root):
                                + '; проверьте DNS, TCP 80 и certbot')
 
 
-def parallel_runtime(state, records):
-    path = Path(state.get('runtime_config') or str(
-        Path(state['panel_binary']).parent / 'bin/config.json'))
-    for _ in range(30):
+def parallel_panel_runtime(records, actual_rows):
+    """Check desired 3x-ui configuration, not an Xray config.json cache.
+
+    Hot-apply via the 3x-ui gRPC API can leave config.json unchanged.
+    """
+    rows = {int(row['id']): row for row in actual_rows}
+    for record in records:
+        inbound_id = int(record['id'])
+        actual = rows.get(inbound_id)
+        wanted = record['after']
+        if (not actual or actual.get('tag') != record['before'].get('tag')
+                or actual.get('protocol') != 'vless'
+                or int(actual.get('port') or 0) != int(record['port'])
+                or actual.get('listen') != '127.0.0.1'):
+            raise RuntimeError('3x-ui не подтвердила loopback-порт inbound ID %d (%d)' %
+                               (inbound_id, record['port']))
+        current_stream = parse(actual.get('streamSettings') or {})
+        expected_stream = parse(wanted.get('streamSettings') or {})
+        current_reality = current_stream.get('realitySettings') or {}
+        expected_reality = expected_stream.get('realitySettings') or {}
+        fields = ('privateKey', 'shortIds', 'serverNames', 'xver')
+        if (current_stream.get('security') != 'reality'
+                or any(current_reality.get(f) != expected_reality.get(f) for f in fields)
+                or (current_reality.get('target') or current_reality.get('dest'))
+                != expected_reality.get('target')
+                or not (current_stream.get('tcpSettings') or {}).get('acceptProxyProtocol')):
+            raise RuntimeError('3x-ui не подтвердила Reality/SNI/PROXY inbound ID %d' %
+                               inbound_id)
+        # New billing clients may be created concurrently. Verify that none
+        # of the pre-existing UUIDs disappeared, but don't demand equal lists.
+        old_clients = (parse(record['before'].get('settings') or {}).get('clients') or [])
+        now_clients = (parse(actual.get('settings') or {}).get('clients') or [])
+        now_uuids = {c.get('id') for c in now_clients}
+        if any(not c.get('id') or c['id'] not in now_uuids for c in old_clients):
+            raise RuntimeError('Исчезли UUID существующих клиентов inbound ID %d' %
+                               inbound_id)
+
+
+def parallel_live_listeners(output, records):
+    """Require one IPv4 loopback TCP listener owned by an Xray process.
+
+    Looking only at the existence of a port can accidentally accept an
+    unrelated service or an inbound exposed on a public address.
+    """
+    entries = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0] != 'LISTEN':
+            continue
+        local = parts[3]
+        if ':' not in local:
+            continue
+        host, raw_port = local.rsplit(':', 1)
+        if not raw_port.isdigit():
+            continue
+        entries.append((host, int(raw_port), line))
+    for r in records:
+        port = int(r['port'])
+        found = [(host, line) for host, p, line in entries if p == port]
+        if len(found) != 1:
+            raise RuntimeError('На TCP %d ожидается один локальный listener Xray, найдено %d' %
+                               (port, len(found)))
+        host, line = found[0]
+        if host != '127.0.0.1':
+            raise RuntimeError('TCP %d слушает %s вместо 127.0.0.1' % (port, host))
+        if 'xray' not in line.lower():
+            raise RuntimeError('TCP %d занят процессом, не подтверждённым как Xray' % port)
+
+
+def parallel_runtime(state, records, api=None):
+    """Check the panel + real Xray listeners + TLS-through-Reality.
+
+    config.json is deliberately not authoritative after a 3x-ui hot reload.
+    No setting is written by these probes.
+    """
+    api = api if api is not None else API(state)
+    last = 'неизвестная ошибка'
+    for _ in range(12):
+        # API errors must stay visible: hiding them behind a generic Xray
+        # timeout makes diagnosis and recovery unnecessarily difficult.
+        parallel_panel_runtime(records, api.list())
         try:
-            config = json.loads(path.read_text())
-            live = config.get('inbounds') or []
-            for r in records:
-                rows = [x for x in live if x.get('tag') == r['before']['tag']
-                        and int(x.get('port') or 0) == int(r['port'])]
-                if len(rows) != 1 or rows[0].get('protocol') != 'vless':
-                    raise ValueError('runtime row is missing')
-                if rows[0].get('listen') != '127.0.0.1':
-                    raise ValueError('runtime inbound is publicly bound')
-                rt = rows[0].get('streamSettings') or {}
-                configured = parse(r['after']['streamSettings'])
-                expected = configured['realitySettings']
-                live_reality = rt.get('realitySettings') or {}
-                if (live_reality.get('privateKey') != expected['privateKey']
-                        or live_reality.get('shortIds') != expected['shortIds']
-                        or live_reality.get('serverNames') != [r['sni']]
-                        or (live_reality.get('target') or live_reality.get('dest')) != expected['target']
-                        or not (rt.get('tcpSettings') or {}).get('acceptProxyProtocol')):
-                    raise ValueError('runtime does not match')
-            return
-        except (OSError, ValueError, KeyError, TypeError):
-            time.sleep(1)
-    raise RuntimeError('Xray не подтвердил работу независимых inbound')
+            ss = subprocess.run(['ss', '-H', '-ltnp'], capture_output=True,
+                                text=True, timeout=5, check=True)
+            parallel_live_listeners(ss.stdout, records)
+            break
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            last = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+            time.sleep(0.5)
+    else:
+        raise RuntimeError('Xray не подтвердил локальные TCP-listener: ' + last)
+    # Unknown REALITY client -> local HTTPS fallback. An nginx-style PROXY v1
+    # header is mandatory because the inbound now accepts nginx stream traffic.
+    for r in records:
+        try:
+            parallel_probe_fallback([r], int(r['port']))
+        except RuntimeError as exc:
+            raise RuntimeError('Reality inbound ID %s (TCP %d): %s' %
+                               (r['id'], r['port'], exc)) from None
 
 
 def parallel_probe_fallback(records, target_port):
@@ -4102,7 +4173,7 @@ def migrate_parallel(state, mapping, save, dry_run=False):
         for r in records:
             api.call('panel/api/inbounds/update/%s' % r['id'], payload(r['after']))
         api.restart()
-        parallel_runtime(state, records)
+        parallel_runtime(state, records, api)
         state['pending_parallel']['stage'] = 'nginx-stream'
         save()
         parallel_write_file(PARALLEL_STREAM, texts[PARALLEL_STREAM].encode())
@@ -4111,13 +4182,9 @@ def migrate_parallel(state, mapping, save, dry_run=False):
         state['pending_parallel']['stage'] = 'subscriptions'
         save()
         parallel_hosts_apply(api, records, groups)
-        # No user identities, UUIDs, keys, shortIds, subscription IDs, or expiry
-        # values are regenerated during the migration.
-        for r in records:
-            actual = next(x for x in api.list() if int(x['id']) == int(r['id']))
-            if (parse(actual['settings']) != parse(r['before']['settings'])
-                    or parse(actual['streamSettings']) != parse(r['after']['streamSettings'])):
-                raise RuntimeError('Изменены параметры клиента или Reality на inbound ' + str(r['id']))
+        # Verify all original client UUIDs remain, allowing new clients
+        # created by the billing integration during the transaction.
+        parallel_panel_runtime(records, api.list())
         state['reality_mode'] = 'parallel'
         state['reality_chain'] = False
         state['primary_internal_port'] = port
@@ -4317,7 +4384,7 @@ def parallel_add_inbound(state, port, sni, save):
         if len(added) != 1:
             raise RuntimeError('Панель потеряла созданный Reality inbound')
         projected[-1].update(id=created_id, before=added[0], after=added[0])
-        parallel_runtime(state, projected)
+        parallel_runtime(state, projected, api)
         parallel_test_client_runtime(state, tag, port, test_client)
         parallel_write_file(PARALLEL_STREAM, contents[PARALLEL_STREAM].encode())
         parallel_nginx()
