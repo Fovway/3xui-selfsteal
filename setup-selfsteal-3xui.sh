@@ -1253,7 +1253,7 @@ show_submenu() {
         printf '    3) ✅ Проверить состояние 3x-ui\n'
         printf '    4) 🛡️ Аудит маскировки сервера\n'
         printf '\n    0) ↩️ Назад в главное меню\n\n'
-        printf '%sВыберите пункт [0–5]: %s' "$cyan" "$reset"
+        printf '%sВыберите пункт [0–4]: %s' "$cyan" "$reset"
         ;;
       selfsteal)
         printf '\n%s  🌐 Настройка Self-Steal%s\n' "$cyan" "$reset"
@@ -1262,9 +1262,9 @@ show_submenu() {
         printf '    2) ➕ Создать новый inbound (VLESS / Hysteria 2)\n'
         printf '    3) 🔗 Исправить цепочку inbound\n'
         printf '    4) ✅ Проверить конфигурацию\n'
-        printf '    5) 🔀 Независимые Reality через nginx / восстановление\n'
+        printf '    5) 🔀 Перевести Reality на независимые SNI-маршруты\n'
         printf '\n    0) ↩️ Назад в главное меню\n\n'
-        printf '%sВыберите пункт [0–4]: %s' "$cyan" "$reset"
+        printf '%sВыберите пункт [0–5]: %s' "$cyan" "$reset"
         ;;
       service)
         printf '\n%s  ⚙️ Обслуживание скрипта%s\n' "$amber" "$reset"
