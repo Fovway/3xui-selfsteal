@@ -939,7 +939,65 @@ def inspect_panel(state, settings, tcp_ports):
             break
 
 
+def inspect_parallel_reality(state, inbounds, runtime, tcp_ports):
+    records = [{'id': state.get('inbound_id'), 'port': state.get('primary_internal_port')}]
+    records += [{'id': r.get('id'), 'port': r.get('port')} for r in state.get('added_inbounds') or []]
+    mapping = state.get('parallel_sni_by_id') or {}
+    seen = set()
+    if len(records) != len(mapping):
+        emit('FAIL', 'Reality SNI маршруты', 'Число записей маршрутизации не совпадает')
+    by_id = {r.get('id'): r for r in inbounds}
+    for rec in records:
+        rid, port = rec['id'], rec['port']
+        sni = mapping.get(str(rid))
+        row = by_id.get(rid)
+        label = 'Reality ID %s' % rid
+        try:
+            stream = json.loads(row.get('stream_settings') or '{}') if row else {}
+            reality = stream.get('realitySettings') or {}
+            good = (sni and sni not in seen and row.get('listen') == '127.0.0.1'
+                    and row.get('protocol') == 'vless' and row.get('port') == port
+                    and stream.get('security') == 'reality' and stream.get('network') in ('tcp', 'raw')
+                    and reality.get('serverNames') == [sni]
+                    and reality.get('target', reality.get('dest')) == '127.0.0.1:9443'
+                    and reality.get('xver') == 1
+                    and (stream.get('tcpSettings') or {}).get('acceptProxyProtocol') is True)
+            if good:
+                emit('OK', label, 'SNI %s; локальный TCP %s -> HTTPS fallback' % (sni, port))
+                seen.add(sni)
+            else:
+                emit('FAIL', label, 'Конфигурация SNI, target, порта или loopback нарушена')
+                continue
+            live = [r for r in runtime if r.get('tag') == row.get('tag') and r.get('port') == port]
+            if (len(live) == 1 and live[0].get('protocol') == 'vless'
+                    and (live[0].get('streamSettings') or {}).get('realitySettings', {}).get('serverNames') == [sni]):
+                emit('OK', 'Xray ' + label, 'Runtime SNI совпадает с панелью')
+            else:
+                emit('FAIL', 'Xray ' + label, 'Runtime не подтверждает inbound')
+            if tcp_ports is not None and port not in tcp_ports:
+                emit('FAIL', 'TCP ' + str(port), 'Внутренний порт Reality не прослушивается')
+        except (ValueError, TypeError, AttributeError, KeyError):
+            emit('FAIL', label, 'Невозможно прочитать параметры inbound')
+    if tcp_ports is None or 443 not in tcp_ports:
+        emit('FAIL', 'nginx TCP 443', 'Публичный TCP 443 не слушается')
+    else:
+        emit('OK', 'nginx TCP 443', 'Внешний общий TCP 443 прослушивается')
+    try:
+        stream_path = Path('/etc/nginx/modules-enabled/99-selfsteal-3xui-stream.conf')
+        content = stream_path.read_text()
+        routing_ok = (content.startswith('# Managed by selfsteal-3xui parallel;')
+                      and all(('%s 127.0.0.1:%s;' % (mapping[str(r['id'])], r['port'])) in content
+                              for r in records if str(r['id']) in mapping))
+        emit('OK' if routing_ok else 'FAIL', 'nginx SNI map',
+             'Все маршруты прописаны' if routing_ok else 'Файл маршрутизации изменён или неполон')
+    except OSError:
+        emit('FAIL', 'nginx SNI map', 'Управляемый stream-файл не найден')
+    return '127.0.0.1'
+
+
 def inspect_reality(state, inbounds, runtime, tcp_ports):
+    if state.get('reality_mode') == 'parallel':
+        return inspect_parallel_reality(state, inbounds, runtime, tcp_ports)
     matches = []
     for row in inbounds:
         if row.get('protocol') != 'vless' or row.get('port') != 443:
