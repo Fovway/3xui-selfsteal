@@ -4,14 +4,14 @@
 
 Интерактивная настройка self-steal Reality для 3x-ui на Ubuntu/Debian с systemd.
 
-## Установка версии с независимыми Reality (эта ветка)
+## Установка команды cascade
 
 Миграция и подключение существующих inbound удалены. Создание новых inbound и обслуживание настроенных SNI-маршрутов доступны.
 
 **Одна команда для установки новой версии скрипта на VPS Ubuntu/Debian:**
 
 ```bash
-curl -fSL https://raw.githubusercontent.com/Fovway/3xui-selfsteal/feature/parallel-reality-sni/setup-selfsteal-3xui.sh -o /tmp/selfsteal-parallel.sh && sudo bash -n /tmp/selfsteal-parallel.sh && sudo bash /tmp/selfsteal-parallel.sh --install-script
+curl -fSL https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh -o /tmp/selfsteal-parallel.sh && sudo bash -n /tmp/selfsteal-parallel.sh && sudo bash /tmp/selfsteal-parallel.sh --install-script
 ```
 
 После этого проверьте версию и откройте меню:
@@ -37,7 +37,7 @@ sudo cascade
 Запустите на целевом сервере от пользователя с `sudo`. Переменные заранее задавать не нужно: скрипт интерактивно запросит домен, название сайта и остальные параметры. Вопросы, справка, сообщения об ошибках и результаты установщика выводятся на русском языке.
 
 ```bash
-curl -fSL https://raw.githubusercontent.com/Fovway/3xui-selfsteal/feature/parallel-reality-sni/setup-selfsteal-3xui.sh -o /tmp/setup-selfsteal-3xui.sh && sudo bash /tmp/setup-selfsteal-3xui.sh
+curl -fSL https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh -o /tmp/setup-selfsteal-3xui.sh && sudo bash /tmp/setup-selfsteal-3xui.sh
 ```
 
 При первом открытии меню скрипт устанавливает себя как `/usr/local/bin/cascade`. После этого меню открывается командой:
@@ -90,7 +90,7 @@ bash /tmp/setup-selfsteal-3xui.sh --help
 
 При открытии главного меню скрипт проверяет версию в `main` на GitHub (тайм-аут до 6 секунд). Если версия новее установленной, под шапкой появляется уведомление с номером новой версии и предложением открыть раздел 4 и выбрать пункт 2. Обновление выполняется только по выбору пользователя; при недоступности GitHub меню работает как обычно.
 
-Раздел 4, пункт 2 обновляет установленную команду из ветки `main` этого репозитория. Перед заменой проверяются принадлежность файла скрипту и синтаксис Bash. При ошибке загрузки или проверки прежняя версия остаётся. Предыдущая версия сохраняется в `/usr/local/share/selfsteal/previous.sh`. Обновление из меню сразу открывает установленную версию; после обновления через `--update-script` запустите `cascade` снова. Загрузка обходит кеш GitHub, результат показывает прежнюю и установленную версии. Номер версии также виден в меню и по команде `selfsteal --version`. Обновляется только скрипт: серверные настройки, пользователи и версия 3x-ui сохраняются. Без меню: `sudo cascade --update-script`.
+Раздел 4, пункт 2 обновляет установленную команду из ветки `main` этого репозитория. Перед заменой проверяются принадлежность файла скрипту и синтаксис Bash. При ошибке загрузки или проверки прежняя версия остаётся. Предыдущая версия сохраняется в `/usr/local/share/cascade/previous.sh`. Обновление из меню сразу открывает установленную версию; после обновления через `--update-script` запустите `cascade` снова. Загрузка обходит кеш GitHub, результат показывает прежнюю и установленную версии. Номер версии также виден в меню и по команде `cascade --version`. Обновляется только скрипт: серверные настройки, пользователи и версия 3x-ui сохраняются. Без меню: `sudo cascade --update-script`.
 
 Раздел 5, пункт 2 удаляет только `/usr/local/bin/cascade` после подтверждения `REMOVE`. Панель, inbound, nginx и резервные копии сохраняются. Без меню: `sudo cascade --uninstall-script`. Вернуть команду можно повторным скачиванием скрипта и запуском с `--install-script`.
 

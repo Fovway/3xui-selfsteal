@@ -46,7 +46,7 @@ class CascadeCliTests(unittest.TestCase):
                 self.assertEqual(command.stat().st_mode & 0o777, 0o755)
                 version = subprocess.run([str(command), '--version'],
                                          capture_output=True, text=True, check=True)
-                self.assertEqual(version.stdout, 'cascade 2026.10.09.14\n')
+                self.assertEqual(version.stdout, 'cascade 2026.10.09.15\n')
 
     def test_foreign_legacy_file_and_symlink_are_preserved(self):
         with tempfile.TemporaryDirectory() as name:

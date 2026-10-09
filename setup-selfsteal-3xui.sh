@@ -4,11 +4,11 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.09.14
+SCRIPT_VERSION=2026.10.09.15
 SCRIPT_COMMAND=/usr/local/bin/cascade
 LEGACY_SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/cascade/previous.sh
-SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/feature/parallel-reality-sni/setup-selfsteal-3xui.sh
+SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
 SCRIPT_MARKER='# Managed command: Fovway/3xui-selfsteal'
 # Network checks must observe this machine, not an inherited proxy.
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY
@@ -21,7 +21,7 @@ while (( $# )); do
 Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access|--tests|--add-hysteria|--masking-audit]
 Без аргументов открывается главное меню. При первом запуске меню устанавливается команда cascade.
 --install-script устанавливает текущую копию скрипта как /usr/local/bin/cascade.
---update-script обновляет команду cascade из рабочей ветки feature/parallel-reality-sni после проверки синтаксиса.
+--update-script обновляет команду cascade из ветки main после проверки синтаксиса.
 --uninstall-script удаляет только команду cascade, сохраняя настройку сервера.
 --install запускает установку/настройку.
 --add-inbound создаёт VLESS + Reality inbound с отдельным тестовым пользователем в независимом режиме; старый режим цепочки не изменён.
