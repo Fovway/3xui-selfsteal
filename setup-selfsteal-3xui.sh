@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.09.10
+SCRIPT_VERSION=2026.10.09.11
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/feature/parallel-reality-sni/setup-selfsteal-3xui.sh
@@ -2988,6 +2988,8 @@ def add_hysteria(state, port, domain, salamander, save):
     save()
     created_id = None
     try:
+        parallel_assert_tls_vhosts(projected[1:])
+        parallel_probe_fallback([projected[-1]], int(state.get('target_port', 9443)))
         created = api.call('panel/api/inbounds/add', inbound)
         if not isinstance(created, dict) or created.get('id') is None:
             raise RuntimeError('Панель не вернула ID нового Hysteria inbound')
@@ -3938,29 +3940,56 @@ def parallel_runtime(state, records, api=None):
                                (r['id'], r['port'], exc)) from None
 
 
-def parallel_probe_fallback(records, target_port):
-    """Check the actual loopback TLS fallback before taking public 443 from Xray.
+def parallel_assert_tls_vhosts(records):
+    """nginx -t succeeds even if the managed conf.d file is not included."""
+    try:
+        config = subprocess.run(['nginx', '-T'], capture_output=True, text=True,
+                                timeout=12)
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError('Не удалось прочитать активную конфигурацию nginx') from None
+    marker = '# configuration file ' + str(PARALLEL_TLS) + ':'
+    if config.returncode or marker not in config.stdout:
+        raise RuntimeError('Nginx не загрузил управляемые HTTPS/SNI-конфигурации: '
+                           + str(PARALLEL_TLS) + '; проверьте include в nginx.conf')
+    section = config.stdout.split(marker, 1)[1].split('\n# configuration file ', 1)[0]
+    for record in records:
+        name = record['sni']
+        if ('server_name ' + name + ';' not in section or
+                '/etc/letsencrypt/live/' + name + '/fullchain.pem;' not in section):
+            raise RuntimeError('Nginx не загрузил HTTPS-сертификат для ' + name)
 
-    The internal HTTPS listener expects the PROXY v1 header sent by REALITY
-    (xver=1), so a plain openssl s_client would give a false negative.
+
+def parallel_probe_fallback(records, target_port):
+    """Probe PROXY v1 + verified TLS, retrying while nginx reload workers rotate.
+
+    systemctl reload can return while previous nginx workers still accept
+    connections with the *old* SNI map. Never cut over Xray on a failed probe.
     """
     context = ssl.create_default_context()
     context.minimum_version = ssl.TLSVersion.TLSv1_3
     for r in records:
-        try:
-            with socket.create_connection(('127.0.0.1', target_port), timeout=6) as raw:
-                raw.settimeout(6)
-                raw.sendall(('PROXY TCP4 127.0.0.1 127.0.0.1 12345 %d\r\n'
-                             % target_port).encode('ascii'))
-                with context.wrap_socket(raw, server_hostname=r['sni']) as tls:
-                    tls.sendall(('HEAD / HTTP/1.1\r\nHost: ' + r['sni']
-                                 + '\r\nConnection: close\r\n\r\n').encode())
-                    line = tls.recv(512).split(b'\r\n', 1)[0]
-                    if not re.match(rb'^HTTP/1\.[01] [2345]\d\d', line):
-                        raise RuntimeError('Некорректный HTTP-ответ локальной HTTPS-заглушки')
-        except (OSError, ssl.SSLError) as exc:
-            raise RuntimeError('HTTPS-заглушка 127.0.0.1:%d не прошла TLS/SNI-проверку для %s (%s)' %
-                               (target_port, r['sni'], type(exc).__name__)) from None
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                with socket.create_connection(('127.0.0.1', target_port), timeout=4) as raw:
+                    raw.settimeout(4)
+                    raw.sendall(('PROXY TCP4 127.0.0.1 127.0.0.1 12345 %d\r\n'
+                                 % target_port).encode('ascii'))
+                    with context.wrap_socket(raw, server_hostname=r['sni']) as tls:
+                        tls.sendall(('HEAD / HTTP/1.1\r\nHost: ' + r['sni']
+                                     + '\r\nConnection: close\r\n\r\n').encode())
+                        line = tls.recv(512).split(b'\r\n', 1)[0]
+                        if not re.match(rb'^HTTP/1\.[01] [2345]\d\d', line):
+                            raise RuntimeError('Некорректный HTTP-ответ HTTPS-заглушки')
+                break
+            except (OSError, ssl.SSLError, RuntimeError) as exc:
+                if time.monotonic() >= deadline:
+                    reason = str(exc).replace('\n', ' ').replace('\r', ' ')[:160]
+                    raise RuntimeError(
+                        'HTTPS-заглушка 127.0.0.1:%d не прошла TLS/SNI-проверку для %s '
+                        '(%s: %s); inbound не изменены' %
+                        (target_port, r['sni'], type(exc).__name__, reason)) from None
+                time.sleep(0.3)
 
 
 def parallel_probe_443(records):
@@ -4260,6 +4289,7 @@ def migrate_parallel(state, mapping, save, dry_run=False):
         # Validate the new TLS vhosts and PROXY-protocol fallback while
         # existing Xray still owns external TCP 443.
         parallel_nginx()
+        parallel_assert_tls_vhosts(records[1:])
         state['pending_parallel']['stage'] = 'fallback-check'
         save()
         parallel_probe_fallback(records, int(state.get('target_port', 9443)))
@@ -4706,8 +4736,8 @@ def parallel_adopt_existing(state, mapping, save, dry_run=False):
         parallel_ensure_certs(state, projected, files, root)
         parallel_write_file(PARALLEL_TLS, files[PARALLEL_TLS].encode())
         parallel_nginx()
-        for r in candidates:
-            parallel_probe_fallback([r], int(state.get('target_port', 9443)))
+        parallel_assert_tls_vhosts(candidates)
+        parallel_probe_fallback(candidates, int(state.get('target_port', 9443)))
         state['pending_adopt']['stage'] = 'xray'
         save()
         for r in candidates:
