@@ -46,6 +46,9 @@ jobs:
       - name: Test test_parallel_adopt_existing.py
         if: always()
         run: python3 -m unittest discover -s tests -p 'test_parallel_adopt_existing.py' -v
+      - name: Test test_parallel_adopt_isolated_tls.py
+        if: always()
+        run: python3 -m unittest discover -s tests -p 'test_parallel_adopt_isolated_tls.py' -v
       - name: Test test_parallel_autotag.py
         if: always()
         run: python3 -m unittest discover -s tests -p 'test_parallel_autotag.py' -v
