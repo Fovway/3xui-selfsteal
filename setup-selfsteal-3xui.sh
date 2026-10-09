@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.09.1
+SCRIPT_VERSION=2026.10.09.2
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/main/setup-selfsteal-3xui.sh
@@ -17,7 +17,7 @@ ACTION='menu'
 while (( $# )); do
   case $1 in
     --help|-h) cat <<'HELP'
-Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access|--tests|--add-hysteria]
+Использование: sudo bash setup-selfsteal-3xui.sh [--install|--add-inbound|--repair-chain|--uninstall|--status|--check|--install-script|--update-script|--uninstall-script|--panel-access|--tests|--add-hysteria|--masking-audit]
 Без аргументов открывается главное меню. При первом запуске меню устанавливается команда selfsteal.
 --install-script устанавливает текущую копию скрипта как /usr/local/bin/selfsteal.
 --update-script обновляет команду selfsteal из main на GitHub после проверки синтаксиса.
@@ -27,6 +27,7 @@ while (( $# )); do
 --repair-chain связывает уже созданные скриптом inbound в цепочку 443 -> дополнительные порты -> nginx и устанавливает fingerprint firefox.
 --uninstall удаляет только компоненты, созданные этим скриптом, и восстанавливает сохранённые конфигурации.
 --status показывает состояние по пунктам без изменений.
+--masking-audit проверяет маскировку Reality/TLS/HTTPS/Hysteria и закрытость панели, не изменяя конфигурацию.
 --panel-access открывает переключатель публичного HTTPS-доступа к панели.
 --add-hysteria добавляет Hysteria 2 на отдельном UDP-порту с TLS и Salamander, не меняя TCP Reality.
 --tests открывает меню внешних тестов VPS.
@@ -52,6 +53,7 @@ HELP
     --panel-access) ACTION=panel-access; shift ;;
     --tests) ACTION=vps-tests; shift ;;
     --status) ACTION=status; shift ;;
+    --masking-audit) ACTION=masking-audit; shift ;;
     --menu) ACTION=menu; shift ;;
     --domain) [[ $# -ge 2 ]] || { echo 'Не указан домен' >&2; exit 2; }; DOMAIN=$2; shift 2 ;;
     *) printf 'Неизвестный аргумент: %s\n' "$1" >&2; exit 2 ;;
@@ -768,6 +770,392 @@ show_github_update_status() {
   fi
 }
 
+masking_audit() {
+  local state_file audit_dir report rc=0 choice
+  command -v python3 >/dev/null 2>&1 || { echo 'Нужен установленный python3.'; return 1; }
+  state_file=$(load_install_state || true)
+  if [[ -z "$state_file" || ! -r "$state_file" ]]; then
+    echo 'Нет сохранённого состояния Self-Steal. Сначала выполните установку.'
+    return 1
+  fi
+  audit_dir=/root/selfsteal-3xui/audit
+  install -d -m 700 "$audit_dir"
+  report=$(mktemp "$audit_dir/audit-$(date +%Y%m%d-%H%M%S)-XXXXXXXX.txt") || return 1
+  chmod 600 "$report"
+  if python3 - "$state_file" <<'MASK_AUDIT_PY' | tee "$report"
+import datetime
+import ipaddress
+import json
+from pathlib import Path
+import re
+import socket
+import sqlite3
+import ssl
+import subprocess
+import sys
+import urllib.parse
+
+# Audit reads local configuration and makes a few bounded requests to the user's
+# own loopback HTTPS endpoint. It never reads key contents or contacts scanners.
+RESULTS = []
+
+
+def emit(level, subject, message):
+    safe = str(message).replace('\n', ' ').replace('\r', ' ')
+    safe = re.sub(r'[\x00-\x1f\x7f]', '', safe)
+    safe = safe[:200]
+    RESULTS.append(level)
+    print('[%-4s] %-28s %s' % (level, subject, safe))
+
+
+def run_cmd(args, timeout=5):
+    try:
+        return subprocess.run(args, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def load_json(path):
+    return json.loads(Path(path).read_text(encoding='utf-8'))
+
+
+def local_tcp_address(listen):
+    if not listen or listen in ('0.0.0.0', '::', '*'):
+        return '127.0.0.1'
+    try:
+        ipaddress.ip_address(listen)
+        return listen
+    except ValueError:
+        return None
+
+
+def local_https_probe(ip, domain, hostname=None):
+    context = ssl.create_default_context()
+    context.set_alpn_protocols(['http/1.1'])
+    # No DNS request to the domain: connect explicitly to the server's own IP.
+    with socket.create_connection((ip, 443), timeout=4) as sock:
+        sock.settimeout(4)
+        with context.wrap_socket(sock, server_hostname=hostname or domain) as conn:
+            tls = conn.version()
+            alpn = conn.selected_alpn_protocol()
+            conn.sendall(('HEAD / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n'
+                          % domain).encode('ascii'))
+            raw = conn.recv(2048)
+            first_line = raw.split(b'\r\n', 1)[0].decode('ascii', errors='replace')
+            match = re.match(r'^HTTP/1\.[01] (\d{3})', first_line)
+            return {'tls': tls, 'alpn': alpn,
+                    'code': int(match.group(1)) if match else None}
+
+
+def port_list(protocol):
+    result = run_cmd(['ss', '-H', '-ln' + protocol])
+    if result is None or result.returncode:
+        return None
+    matches = []
+    for row in result.stdout.splitlines():
+        tokens = row.split()
+        # ss -H -ltn/-lun: local address is field 4 (index 4).
+        if len(tokens) < 5:
+            continue
+        addr = tokens[4]
+        m = re.search(r':(\d+)$', addr)
+        if m:
+            matches.append(int(m.group(1)))
+    return matches
+
+
+def check_certificate(domain, cert_path):
+    cert = Path(cert_path)
+    if not cert.is_file():
+        emit('FAIL', 'TLS-сертификат', 'Не найден fullchain.pem для домена')
+        return
+    check = run_cmd(['openssl', 'x509', '-in', str(cert), '-noout',
+                     '-checkend', '604800'])
+    if check is None:
+        emit('WARN', 'TLS-сертификат', 'openssl недоступен; срок не проверен')
+    elif check.returncode:
+        emit('WARN', 'TLS-сертификат', 'Истекает менее чем через 7 дней или недействителен')
+    else:
+        emit('OK', 'TLS-сертификат', 'Не истечёт в ближайшие 7 дней')
+    match = run_cmd(['openssl', 'x509', '-in', str(cert), '-noout',
+                     '-checkhost', domain])
+    if match is None:
+        emit('WARN', 'Имя TLS-сертификата', 'Проверка недоступна')
+    elif match.returncode == 0 and 'does match certificate' in match.stdout:
+        emit('OK', 'Имя TLS-сертификата', 'Соответствует настроенному SNI')
+    else:
+        emit('FAIL', 'Имя TLS-сертификата', 'Не соответствует настроенному домену')
+
+
+def inspect_database(state):
+    db_path = Path(state.get('panel_db') or '/etc/x-ui/x-ui.db')
+    if not db_path.is_file():
+        emit('WARN', 'База 3x-ui', 'Нет локальной БД для проверки')
+        return {}, []
+    try:
+        db_url = 'file:' + urllib.parse.quote(str(db_path)) + '?mode=ro'
+        with sqlite3.connect(db_url, uri=True, timeout=3) as db:
+            db.execute('PRAGMA query_only=ON')
+            settings = dict(db.execute('SELECT key, value FROM settings'))
+            db.row_factory = sqlite3.Row
+            inbounds = [dict(r) for r in db.execute(
+                'SELECT id, port, protocol, listen, stream_settings, tag '
+                'FROM inbounds WHERE node_id IS NULL OR node_id=0')]
+        emit('OK', 'База 3x-ui', 'Прочитана без изменений')
+        return settings, inbounds
+    except (sqlite3.Error, OSError, ValueError):
+        emit('WARN', 'База 3x-ui', 'Не удалось прочитать настройки в режиме read-only')
+        return {}, []
+
+
+def inspect_panel(state, settings, tcp_ports):
+    host = settings.get('webListen')
+    panel_port = int(settings.get('webPort') or state.get('panel_port') or 2053)
+    if host in ('127.0.0.1', '::1'):
+        emit('OK', 'Админ-панель 3x-ui', 'Веб-интерфейс слушает только loopback')
+    elif host is None:
+        emit('WARN', 'Админ-панель 3x-ui', 'Адрес прослушивания неизвестен')
+    else:
+        emit('FAIL', 'Админ-панель 3x-ui', 'Веб-интерфейс не ограничен loopback')
+    if tcp_ports is None:
+        emit('WARN', 'Порт панели', 'Не удалось получить TCP-listeners')
+    elif panel_port in tcp_ports and host not in ('127.0.0.1', '::1'):
+        emit('WARN', 'Порт панели', 'Порт панели прослушивается вне loopback')
+    elif panel_port in tcp_ports:
+        emit('OK', 'Порт панели', 'Локальный listener обнаружен')
+    else:
+        emit('WARN', 'Порт панели', 'Указанный порт не найден среди listeners')
+    if state.get('publish_panel'):
+        emit('WARN', 'Публичный доступ', 'HTTPS-маршрут панели включён намеренно')
+    else:
+        emit('OK', 'Публичный доступ', 'По сохранённым настройкам публикация выключена')
+    for key in ('subListen', 'subJsonListen', 'subClashListen'):
+        if settings.get(key) and settings.get(key) not in ('127.0.0.1', '::1'):
+            emit('WARN', 'Сервис подписок', 'Один из адресов подписок не loopback')
+            break
+
+
+def inspect_reality(state, inbounds, runtime, tcp_ports):
+    matches = []
+    for row in inbounds:
+        if row.get('protocol') != 'vless' or row.get('port') != 443:
+            continue
+        try:
+            stream = json.loads(row.get('stream_settings') or '{}')
+        except (ValueError, TypeError):
+            continue
+        if stream.get('security') == 'reality' and stream.get('network') in ('tcp', 'raw'):
+            matches.append((row, stream))
+    if len(matches) != 1:
+        emit('FAIL', 'Reality TCP 443', 'Ожидался ровно один VLESS/Reality inbound')
+        return None
+    row, stream = matches[0]
+    emit('OK', 'Reality TCP 443', 'VLESS + Reality/TCP найден')
+    reality = stream.get('realitySettings') or {}
+    domain = state.get('domain', '')
+    if reality.get('serverNames') == [domain]:
+        emit('OK', 'Reality SNI', 'Совпадает с доменом установки')
+    else:
+        emit('FAIL', 'Reality SNI', 'Не соответствует домену установки')
+    target = reality.get('target') or reality.get('dest') or ''
+    target_match = re.fullmatch(r'127\.0\.0\.1:(\d+)', str(target))
+    if target_match:
+        emit('OK', 'Reality target', 'Переход на локальный HTTPS listener')
+    else:
+        emit('WARN', 'Reality target', 'Не указывает на 127.0.0.1:порт')
+    live_rows = [r for r in runtime if r.get('tag') == row.get('tag')]
+    if len(live_rows) == 1 and live_rows[0].get('protocol') == 'vless':
+        live_reality = ((live_rows[0].get('streamSettings') or {}).get('realitySettings') or {})
+        if (live_reality.get('serverNames') == reality.get('serverNames')
+                and (live_reality.get('target') or live_reality.get('dest')) == target):
+            emit('OK', 'Xray Reality runtime', 'SNI и target соответствуют базе')
+        else:
+            emit('FAIL', 'Xray Reality runtime', 'Рабочая конфигурация отличается от базы')
+    else:
+        emit('WARN', 'Xray Reality runtime', 'Inbound не подтверждён в config.json')
+    if tcp_ports is None:
+        emit('WARN', 'TCP 443 listener', 'Не удалось прочитать ss')
+    elif 443 in tcp_ports:
+        emit('OK', 'TCP 443 listener', 'Слушающий TCP-порт обнаружен')
+    else:
+        emit('FAIL', 'TCP 443 listener', 'TCP 443 не прослушивается')
+    return local_tcp_address(row.get('listen'))
+
+
+def inspect_hysteria(inbounds, runtime, udp_ports):
+    entries = [r for r in inbounds if r.get('protocol') == 'hysteria']
+    if not entries:
+        emit('SKIP', 'Hysteria 2', 'Inbound этого типа отсутствуют')
+        return
+    for row in entries[:30]:
+        port = row.get('port')
+        label = 'Hysteria UDP %s' % port
+        try:
+            stream = json.loads(row.get('stream_settings') or '{}')
+            hsettings = stream.get('hysteriaSettings') or {}
+            tls = stream.get('tlsSettings') or {}
+            certs = tls.get('certificates') or []
+            masks = ((stream.get('finalmask') or {}).get('udp') or [])
+            has_tls = (stream.get('security') == 'tls'
+                       and stream.get('network') == 'hysteria'
+                       and 'h3' in (tls.get('alpn') or [])
+                       and any(Path(c.get('certificateFile') or '/missing-cert').is_file()
+                               for c in certs))
+            if hsettings.get('version') == 2 and has_tls:
+                emit('OK', label, 'Hysteria 2, TLS, h3 и сертификат настроены')
+            else:
+                emit('FAIL', label, 'Некорректная версия, TLS/ALPN или сертификат')
+            invalid = any(m.get('type') == 'salamander'
+                          and not (m.get('settings') or {}).get('password') for m in masks)
+            if invalid:
+                emit('FAIL', 'Salamander UDP %s' % port, 'Не задан пароль маскировки')
+            elif masks:
+                emit('OK', 'Salamander UDP %s' % port, 'UDP-маскировка задана')
+            else:
+                emit('WARN', 'Salamander UDP %s' % port, 'Маскировка отключена')
+            if udp_ports is None:
+                emit('WARN', 'UDP listener %s' % port, 'ss недоступен')
+            elif port in udp_ports:
+                emit('OK', 'UDP listener %s' % port, 'UDP-порт прослушивается')
+            else:
+                emit('FAIL', 'UDP listener %s' % port, 'UDP-порт не прослушивается')
+            running = [r for r in runtime if r.get('tag') == row.get('tag')
+                       and r.get('protocol') == 'hysteria']
+            if len(running) != 1:
+                emit('WARN', 'Xray Hysteria %s' % port, 'Не подтверждён в runtime')
+            else:
+                emit('OK', 'Xray Hysteria %s' % port, 'Inbound присутствует в runtime')
+        except (ValueError, TypeError, AttributeError, OSError):
+            emit('WARN', label, 'Не удалось прочитать конфигурацию inbound')
+    if len(entries) > 30:
+        emit('WARN', 'Hysteria', 'Проверено только 30 из найденных inbound')
+
+
+def run_audit(state):
+    print('Аудит маскировки 3x-ui Self-Steal')
+    print('Время UTC:', datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M'))
+    print('Проверяются только локальные настройки и собственный HTTPS listener.')
+    print('Статусы отражают локальную конфигурацию, а не видимость для ТСПУ.')
+    print('--------------------------------------------------------------')
+    settings, inbounds = inspect_database(state)
+    runtime = []
+    runtime_file = Path(state.get('runtime_config')
+                        or str(Path(state.get('panel_binary') or '/usr/local/x-ui/x-ui').parent
+                               / 'bin/config.json'))
+    try:
+        runtime = (load_json(runtime_file).get('inbounds') or [])
+        emit('OK', 'Xray runtime', 'Конфигурация прочитана')
+    except (OSError, ValueError, TypeError, AttributeError):
+        emit('WARN', 'Xray runtime', 'config.json недоступен')
+    tcp_ports = port_list('t')
+    udp_ports = port_list('u')
+    inspect_panel(state, settings, tcp_ports)
+    ip = inspect_reality(state, inbounds, runtime, tcp_ports)
+    inspect_hysteria(inbounds, runtime, udp_ports)
+    domain = state.get('domain') or ''
+    if domain and re.fullmatch(r'[a-zA-Z0-9.-]+', domain):
+        check_certificate(domain, '/etc/letsencrypt/live/' + domain + '/fullchain.pem')
+    else:
+        emit('WARN', 'Домен установки', 'Не указан или некорректен')
+    if ip and domain:
+        try:
+            response = local_https_probe(ip, domain)
+            if response['code'] is None:
+                emit('WARN', 'HTTPS-заглушка', 'Нет HTTP-ответа на HEAD /')
+            elif response['code'] in (200, 301, 302, 303, 307, 308, 403, 404, 405):
+                emit('OK', 'HTTPS-заглушка', 'TLS %s, HTTP %s' % (
+                    response['tls'], response['code']))
+            else:
+                emit('WARN', 'HTTPS-заглушка', 'HTTP %s, стоит проверить' % response['code'])
+            if response['alpn'] == 'http/1.1':
+                emit('OK', 'ALPN HTTPS', 'Согласован http/1.1')
+            else:
+                emit('WARN', 'ALPN HTTPS', 'ALPN отличается от http/1.1')
+        except (OSError, ssl.SSLError, ValueError, UnicodeError):
+            emit('WARN', 'HTTPS-заглушка', 'Локальное TLS-подключение не подтвердилось')
+        try:
+            # One benign invalid SNI handshake — it cannot simulate remote DPI.
+            invalid = local_https_probe(ip, domain, hostname='invalid.example')
+            emit('OK' if invalid.get('code') else 'WARN', 'Неизвестный SNI',
+                 'Обычный HTTPS-ответ' if invalid.get('code') else 'Ответ без HTTP')
+        except (OSError, ssl.SSLError, ValueError, UnicodeError):
+            emit('WARN', 'Неизвестный SNI', 'TLS отклонён; внешнее поведение не определено')
+    else:
+        emit('SKIP', 'HTTPS-заглушка', 'Локальный адрес Reality не определён')
+    if tcp_ports is not None and udp_ports is not None:
+        expected = {22, 80, 443}
+        unknown_tcp = sorted(set(tcp_ports) - expected)
+        unknown_udp = sorted(set(udp_ports) - {443})
+        emit('OK', 'TCP/UDP listeners', 'Инвентаризация выполнена (без проверки снаружи)')
+        if unknown_tcp or unknown_udp:
+            emit('WARN', 'Дополнительные порты',
+                 '%s иных TCP и %s иных UDP портов; проверьте назначение' % (
+                     len(unknown_tcp), len(unknown_udp)))
+    firewall = run_cmd(['ufw', 'status'], timeout=4)
+    if firewall is None:
+        emit('WARN', 'UFW', 'Не найден; проверьте nftables и фаервол провайдера')
+    elif 'Status: active' in firewall.stdout:
+        emit('OK', 'UFW', 'Активен; правила и фаервол провайдера проверяйте отдельно')
+    else:
+        emit('WARN', 'UFW', 'Неактивен или статус неизвестен')
+    print('--------------------------------------------------------------')
+    print('Итого: OK=%d WARN=%d FAIL=%d SKIP=%d' % tuple(
+        RESULTS.count(v) for v in ('OK', 'WARN', 'FAIL', 'SKIP')))
+    print('Внешняя доступность из России и поведение ТСПУ здесь НЕ проверяются.')
+    return 1 if 'FAIL' in RESULTS else 0
+
+
+def main(argv):
+    if len(argv) != 1:
+        print('Нужен путь к state.json', file=sys.stderr)
+        return 2
+    try:
+        state = load_json(argv[0])
+    except (OSError, ValueError):
+        print('Не удалось прочитать состояние Self-Steal.', file=sys.stderr)
+        return 2
+    if state.get('removed'):
+        print('Установка помечена как удалённая.', file=sys.stderr)
+        return 2
+    try:
+        return run_audit(state)
+    except Exception:
+        print('Аудит не завершился из-за ошибки чтения. Конфигурация не менялась.',
+              file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
+MASK_AUDIT_PY
+  then
+    rc=0
+  else
+    rc=1
+  fi
+  printf '\nОтчёт TXT (только root): %s\n' "$report"
+  if [[ -t 0 ]]; then
+    while :; do
+      printf '\n1) Сохранить PNG\n0) Назад в меню\nВыберите действие [0–1]: '
+      read -r choice || break
+      case "$choice" in
+        1)
+          if python3 -c 'from PIL import Image, ImageDraw, ImageFont' >/dev/null 2>&1 && [[ -f /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf ]]; then
+            save_test_screenshot 'Аудит маскировки Self-Steal' "$report" || true
+          else
+            echo 'PNG пропущен: нужен python3-pil и шрифт DejaVu. Аудит не устанавливает пакеты.'
+          fi
+          ;;
+        0) break ;;
+        *) echo 'Введите 0 или 1.' ;;
+      esac
+    done
+  fi
+  return "$rc"
+}
+
 show_inbound_type_menu() {
   local choice
   while :; do
@@ -797,8 +1185,9 @@ show_submenu() {
         printf '    1) 🔗 Показать адрес панели управления\n'
         printf '    2) 🌐 Включить / выключить доступ к панели\n'
         printf '    3) ✅ Проверить состояние 3x-ui\n'
+        printf '    4) 🛡️ Аудит маскировки сервера\n'
         printf '\n    0) ↩️ Назад в главное меню\n\n'
-        printf '%sВыберите пункт [0–3]: %s' "$cyan" "$reset"
+        printf '%sВыберите пункт [0–4]: %s' "$cyan" "$reset"
         ;;
       selfsteal)
         printf '\n%s  🌐 Настройка Self-Steal%s\n' "$cyan" "$reset"
@@ -834,6 +1223,7 @@ show_submenu() {
       xui:1) show_panel_address; menu_pause ;;
       xui:2) ACTION=panel-access; return 0 ;;
       xui:3) show_xui_status; menu_pause ;;
+      xui:4) masking_audit; menu_pause ;;
       selfsteal:1) ACTION=install; return 0 ;;
       selfsteal:2) show_inbound_type_menu; [[ "$ACTION" == menu ]] || return 0 ;;
       selfsteal:3) ACTION=repair-chain; return 0 ;;
@@ -1410,6 +1800,7 @@ case "$ACTION" in
   vps-tests) show_vps_tests_menu; exit 0 ;;
   uninstall) uninstall_script ;;
   status) status_report ;;
+  masking-audit) masking_audit; exit $? ;;
 esac
 
 (( CHECK )) || [[ -t 0 ]] || fail 'Требуется интерактивный терминал.'
