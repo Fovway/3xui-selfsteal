@@ -3801,9 +3801,11 @@ def parallel_ensure_certs(state, records, texts, root):
 
 
 def parallel_panel_runtime(records, actual_rows):
-    """Check desired 3x-ui configuration, not an Xray config.json cache.
+    """Check the panel's desired config, independent of runtime file snapshots.
 
-    Hot-apply via the 3x-ui gRPC API can leave config.json unchanged.
+    3x-ui can hot-apply some edits, while its explicit restart forces a
+    process reload. Neither a saved JSON file nor DB state alone proves that
+    the expected TCP listener is currently accepting Reality traffic.
     """
     rows = {int(row['id']): row for row in actual_rows}
     for record in records:
@@ -3870,10 +3872,10 @@ def parallel_live_listeners(output, records):
 
 
 def parallel_runtime(state, records, api=None):
-    """Check the panel + real Xray listeners + TLS-through-Reality.
+    """Check panel state, actual Xray listeners and TLS-through-Reality.
 
-    config.json is deliberately not authoritative after a 3x-ui hot reload.
-    No setting is written by these probes.
+    A successful panel restart does not by itself prove that all inbound
+    listeners are bound and reachable. No setting is changed by these probes.
     """
     api = api if api is not None else API(state)
     last = 'неизвестная ошибка'
