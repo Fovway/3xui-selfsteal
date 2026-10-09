@@ -3805,6 +3805,10 @@ def migrate_parallel(state, mapping, save):
         raise RuntimeError('Есть незавершённая параллельная миграция. Сначала восстановите её.')
     api = API(state)
     records = parallel_preconditions(state, mapping, api)
+    # A root module include is required before touching any live service.
+    # Check for unrelated stream listeners to avoid assuming ownership of 443.
+    if any((r['before'].get('listen') or '') == '::' for r in records):
+        raise RuntimeError('IPv6 wildcard inbound требует ручной проверки перед миграцией')
     for r in records:
         parallel_dns_check(r['sni'], state['domain'])
     port = parallel_pick_port([x.get('port') for x in api.list()])
@@ -3831,6 +3835,17 @@ def migrate_parallel(state, mapping, save):
         raise RuntimeError('nginx.conf не включает modules-enabled; безопасная миграция невозможна')
     if not Path('/usr/lib/nginx/modules/ngx_stream_module.so').is_file():
         raise RuntimeError('Не установлен модуль nginx stream: sudo apt-get install libnginx-mod-stream')
+    # Do not put an extra stream block behind an existing user-owned listener.
+    test = subprocess.run(['nginx', '-T'], capture_output=True, text=True, timeout=12)
+    if test.returncode:
+        raise RuntimeError('Текущий nginx -T содержит ошибку')
+    if re.search(r'\bstream\s*\{', test.stdout):
+        raise RuntimeError('В nginx уже есть stream-блок: требуется ручное согласование')
+    listeners = subprocess.run(['ss', '-H', '-ltnp', 'sport = :443'],
+                               capture_output=True, text=True, timeout=5, check=True)
+    for line in listeners.stdout.splitlines():
+        if 'xray' not in line.lower():
+            raise RuntimeError('TCP 443 занят посторонним listener, миграция отменена')
     for r in records[1:]:
         if parallel_host_group(api, r['id'], api.call('panel/api/hosts/list') or []) is None:
             raise RuntimeError('Не найдена группа подписки для дополнительного inbound')
