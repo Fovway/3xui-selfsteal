@@ -855,10 +855,10 @@ def port_list(protocol):
     matches = []
     for row in result.stdout.splitlines():
         tokens = row.split()
-        # ss -H -ltn/-lun: local address is field 4 (index 4).
+        # ss -H -ltn/-lun: local address is the fourth column (index 3).
         if len(tokens) < 5:
             continue
-        addr = tokens[4]
+        addr = tokens[3]
         m = re.search(r':(\d+)$', addr)
         if m:
             matches.append(int(m.group(1)))
@@ -1223,7 +1223,7 @@ show_submenu() {
       xui:1) show_panel_address; menu_pause ;;
       xui:2) ACTION=panel-access; return 0 ;;
       xui:3) show_xui_status; menu_pause ;;
-      xui:4) masking_audit; menu_pause ;;
+      xui:4) masking_audit || true; menu_pause ;;
       selfsteal:1) ACTION=install; return 0 ;;
       selfsteal:2) show_inbound_type_menu; [[ "$ACTION" == menu ]] || return 0 ;;
       selfsteal:3) ACTION=repair-chain; return 0 ;;
