@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 XUI_VERSION=3.8.5
-SCRIPT_VERSION=2026.10.09.9
+SCRIPT_VERSION=2026.10.09.10
 SCRIPT_COMMAND=/usr/local/bin/selfsteal
 SCRIPT_BACKUP=/usr/local/share/selfsteal/previous.sh
 SCRIPT_URL=https://raw.githubusercontent.com/Fovway/3xui-selfsteal/feature/parallel-reality-sni/setup-selfsteal-3xui.sh
@@ -4081,6 +4081,17 @@ def parallel_hosts_restore(api, records, originals):
         elif before or current:
             raise RuntimeError('Группа hosts изменила ID или состав: нужен ручной откат')
 
+def parallel_inbound_fields_changed(current, restored):
+    """Compare JSON-encoded streamSettings as JSON and all other fields as raw data."""
+    for key in ('port', 'listen', 'streamSettings', 'shareAddrStrategy', 'shareAddr'):
+        value, expected = current.get(key), restored.get(key)
+        if key == 'streamSettings':
+            value, expected = parse(value or {}), parse(expected or {})
+        if value != expected:
+            return True
+    return False
+
+
 def parallel_rollback_inbound(before, current, expected=None):
     """Undo only migration-owned fields, retaining billing-created users/UUIDs.
 
@@ -4127,9 +4138,7 @@ def parallel_restore_backup(state, api, backup, save):
         current = current_by_id.get(int(old['id']))
         restored = parallel_rollback_inbound(
             old, current, expected_by_id.get(int(old['id'])))
-        if any(parse(current.get(k)) != parse(restored.get(k))
-               for k in ('port', 'listen', 'streamSettings',
-                         'shareAddrStrategy', 'shareAddr')):
+        if parallel_inbound_fields_changed(current, restored):
             updates.append((int(old['id']), restored))
     # Refuse external conflicts BEFORE releasing nginx/Xray sockets.
     parallel_restore_files(files)
@@ -4635,8 +4644,9 @@ def parallel_adopt_rollback(state, api, backup, save):
         ident = int(old['id'])
         current = present.get(ident)
         restored = parallel_rollback_inbound(old, current, expected[ident])
-        if any(parse(current.get(k)) != parse(restored.get(k)) for k in
-               ('port', 'listen', 'streamSettings', 'shareAddrStrategy', 'shareAddr')):
+        if parallel_inbound_fields_changed(current, restored):
+            if state.get('pending_adopt', {}).get('stage') == 'certificates':
+                raise RuntimeError('Inbound ID %d изменён извне при выпуске сертификата; его настройки не перезаписываются' % ident)
             edits.append((ident, restored))
     # Preserve external 443 ownership: never disable existing stream listeners.
     parallel_restore_files(former_files)
@@ -4648,9 +4658,7 @@ def parallel_adopt_rollback(state, api, backup, save):
         new_rows = {int(r['id']): r for r in api.list()}
         for ident, restored in edits:
             actual = new_rows.get(ident)
-            if not actual or any(
-                    parse(actual.get(k)) != parse(restored.get(k))
-                    for k in ('streamSettings', 'listen', 'port')):
+            if not actual or parallel_inbound_fields_changed(actual, restored):
                 raise RuntimeError('После отката inbound ID %d имеет другие настройки' % ident)
             old_ids = {c['id'] for c in
                        parse(next(row for row in before_rows
